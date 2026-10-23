@@ -54,6 +54,7 @@ stdenv.mkDerivation {
 
   env = {
     coreDev = "${core.dev}";
+    coreSource = "${core.source}";
     compileDrv = "${compileDrv}";
   };
 
@@ -66,6 +67,19 @@ stdenv.mkDerivation {
     # command lines match and nothing is recompiled.
     mkdir -p "modsrc/$(dirname "${info.dir}")"
     cp -a --reflink=auto "$compileDrv/self/." "modsrc/${info.dir}/"
+
+    # extra source dirs the mapper detected (relative-include targets);
+    # needed if make decides to recompile anything
+    while IFS= read -r line; do
+      case "$line" in
+        extraDirs=*) extraDirs="''${line#extraDirs=}" ;;
+      esac
+    done < "$compileDrv/manifest.txt"
+    for d in $extraDirs; do
+      mkdir -p "modsrc/$(dirname "$d")"
+      cp -a --reflink=auto "$coreSource/$d" "modsrc/$d"
+    done
+
     # store paths are read-only; modpost/modfinal must write into the tree
     chmod -R u+w modsrc
     mkdir -p modsrc/a/b

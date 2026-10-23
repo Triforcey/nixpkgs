@@ -606,6 +606,33 @@ class Mapper:
                     self.warnings.append(f"{m['dir']}: no source found for object {obj}")
             m["sources"] = srcs
 
+    def detect_extra_dirs(self):
+        """Modules may include headers outside their own directory via
+        relative paths (e.g. ../serial_mctrl_gpio.h). The compile drv only
+        copies the module dir, so record every in-tree directory that must
+        also be copied for the includes to resolve. Over-approximation is
+        safe (extra copied sources)."""
+        inc_re = re.compile(r'#\s*include\s+"([^"]+)"')
+        for m in self.modules.values():
+            extras = set()
+            for src in m["sources"]:
+                srcdir = os.path.dirname(src)
+                try:
+                    with open(os.path.join(self.srcdir, src), errors="replace") as f:
+                        text = f.read()
+                except OSError:
+                    continue
+                for mm in inc_re.finditer(text):
+                    inc = mm.group(1)
+                    if inc.startswith("/"):
+                        continue
+                    target = os.path.normpath(os.path.join(srcdir, inc))
+                    if target != m["dir"] and not target.startswith(m["dir"] + os.sep):
+                        d = os.path.dirname(target)
+                        if d and d != m["dir"]:
+                            extras.add(d)
+            m["extraDirs"] = sorted(extras)
+
     def scan_exports_and_deps(self):
         mod_files = [(m["key"], [os.path.join(self.srcdir, s) for s in m["sources"]]) for m in self.modules.values()]
         files = [f for _, fs in mod_files for f in fs]
@@ -658,6 +685,7 @@ class Mapper:
         else:
             self.warnings.append("root: no Kbuild file")
         self.resolve_sources()
+        self.detect_extra_dirs()
         self.scan_exports_and_deps()
 
 

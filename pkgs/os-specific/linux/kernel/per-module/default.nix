@@ -95,7 +95,12 @@ let
         }
       ) m.deps;
       presentDeps = lib.filter (p: p.drv != null) depPairs;
-      extraDirs = extraSourceDirs.${m.name} or [ ];
+      # Directories outside the module dir whose headers the module's
+      # sources include via relative paths (mapper-detected), plus any
+      # user-provided escape hatch. Over-approximation is safe.
+      extraDirs = lib.unique (
+        (m.extraDirs or [ ]) ++ extraSourceDirs.${m.name} or [ ]
+      );
       quotedFlags = lib.concatMapStringsSep " " lib.escapeShellArg moduleMakeFlags;
       target = "${m.name}.o";
     in
@@ -197,6 +202,7 @@ let
           echo "name=${m.name}"
           echo "dir=${m.dir}"
           echo "objects=${lib.concatStringsSep " " m.objects}"
+          echo "extraDirs=${lib.concatStringsSep " " extraDirs}"
         } > "$out/manifest.txt"
 
         runHook postInstall
