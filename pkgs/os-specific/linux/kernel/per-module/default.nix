@@ -67,7 +67,15 @@ let
       [ kernel.target "scripts_gdb" ]
       ++ lib.optionals kernel.buildDTBs [ "dtbs" ];
     installTargets = [ (kernel.installTargetFor kernel.target) ];
-    preInstall = ''
+    preInstall = (old.preInstall or "") + ''
+      # Stash files that this kernel's `make clean` (run by postInstall)
+      # removes but downstream modpost/modfinal need:
+      #   scripts/module.lds - prerequisite of the %.ko rule; when missing,
+      #     make rejects the pattern rule with "No rule to make target
+      #     '<module>.ko'"
+      #   Module.symvers     - the core's vmlinux exports
+      cp "$buildRoot/scripts/module.lds" "$NIX_BUILD_TOP/module.lds.stash" 2>/dev/null || true
+      cp "$buildRoot/Module.symvers" "$NIX_BUILD_TOP/Module.symvers.stash" 2>/dev/null || true
       # Snapshot the full patched source before postInstall prunes the dev
       # tree (drivers are deleted there). Per-module compile drvs compile
       # against this tree, so they are consistent with the core by
@@ -78,6 +86,17 @@ let
       # sourceRoot, so $PWD is already .../source.
       mkdir -p "${placeholder "source"}"
       cp -a --reflink=auto "$dev/lib/modules/${modDirVersion}/source/." "${placeholder "source"}/"
+    '';
+    postInstall = (old.postInstall or "") + ''
+      # Restore the stashed module-linking interface files into the
+      # retained build tree.
+      if [ -f "$NIX_BUILD_TOP/module.lds.stash" ]; then
+        mkdir -p "$dev/lib/modules/${modDirVersion}/build/scripts"
+        cp "$NIX_BUILD_TOP/module.lds.stash" "$dev/lib/modules/${modDirVersion}/build/scripts/module.lds"
+      fi
+      if [ -f "$NIX_BUILD_TOP/Module.symvers.stash" ]; then
+        cp "$NIX_BUILD_TOP/Module.symvers.stash" "$dev/lib/modules/${modDirVersion}/build/Module.symvers"
+      fi
     '';
   });
 

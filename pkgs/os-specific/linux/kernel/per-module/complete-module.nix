@@ -91,6 +91,7 @@ stdenv.mkDerivation {
     if [ -s "$compileDrv/dep-manifest.txt" ]; then
       objlist=()
       while IFS=$'\t' read -r depName depPath; do
+        [ -n "$depName" ] || continue
         obj="$depPath/self/$depName.o"
         if [ -f "$obj" ]; then
           objlist+=("$obj")
