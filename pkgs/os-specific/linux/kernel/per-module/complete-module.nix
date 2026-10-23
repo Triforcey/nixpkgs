@@ -134,8 +134,12 @@ stdenv.mkDerivation {
     # errors - the undefined symbols are resolved at insmod time against
     # the aggregated tree, which is the honest semantics for a drop-in
     # artifact.
+    # O= pins the objtree at the writable copy: kbuild re-execs when
+    # cwd != objtree, and the shim regenerated during modules_prepare
+    # would otherwise point back at the read-only store path.
     make -C "$buildTree" -j"$NIX_BUILD_CORES" \
       ${quotedFlags} \
+      "O=$buildTree" \
       "KCFLAGS=-I$PWD/modsrc/a/b" \
       "KBUILD_MODPOST_WARN=1" \
       "M=$PWD/modsrc/${info.dir}" \
@@ -144,13 +148,16 @@ stdenv.mkDerivation {
 
     # Install exactly this module: modinst (sign/compress/install) reads
     # MODORDER from the make cwd, so point it at a one-entry list.
+    sed -i "s|^export KBUILD_OUTPUT.*|export KBUILD_OUTPUT = $buildTree|" "$buildTree/Makefile"
     echo "${info.name}.o" > "$buildTree/modules.order"
-    make -C "$coreBuild" -j"$NIX_BUILD_CORES" \
+    echo "${info.name}.o" > "modsrc/${info.dir}/modules.order"
+    make -C "$buildTree" -j"$NIX_BUILD_CORES" \
       ${quotedFlags} \
+      "O=$buildTree" \
       "M=$PWD/modsrc/${info.dir}" \
       "INSTALL_MOD_PATH=$out" \
       modules_install
-    rm -f "$coreBuild/modules.order"
+    rm -f "$buildTree/modules.order"
 
     runHook postBuild
   '';
