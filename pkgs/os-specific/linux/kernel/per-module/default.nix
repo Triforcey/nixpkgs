@@ -134,6 +134,7 @@ let
             map (d: ''
               mkdir -p "modsrc/${d}"
               cp -a --reflink=auto "$coreSource/${d}/." "modsrc/${d}/"
+              chmod -R u+w "modsrc/${d}"
             '') extraDirs
           );
         in
@@ -146,11 +147,12 @@ let
           # in-tree layout, output written next to them by `make M=`
           mkdir -p "modsrc/${m.dir}"
           # contents form: the destination may already exist (module dirs
-          # nested inside extraDirs); cp -a SRC DST would nest otherwise
+          # nested inside extraDirs); cp -a SRC DST would nest otherwise.
+          # Store paths are read-only: chmod after every copy so later
+          # copies can overwrite and the build can write its artifacts.
           cp -a --reflink=auto "$coreSource/${m.dir}/." "modsrc/${m.dir}/"
+          chmod -R u+w modsrc
           ${copyExtra}
-          # store paths are read-only; the build must be able to write its
-          # artifacts next to the sources
           chmod -R u+w modsrc
 
           # compile only: the object target stops Kbuild right after the

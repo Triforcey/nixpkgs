@@ -67,6 +67,9 @@ stdenv.mkDerivation {
     # command lines match and nothing is recompiled.
     mkdir -p "modsrc/$(dirname "${info.dir}")"
     cp -a --reflink=auto "$compileDrv/self/." "modsrc/${info.dir}/"
+    # store paths are read-only; make writable so later copies can
+    # overwrite and modpost/modfinal can write into the tree
+    chmod -R u+w modsrc
 
     # extra source dirs the mapper detected (relative-include targets);
     # needed if make decides to recompile anything
@@ -78,10 +81,9 @@ stdenv.mkDerivation {
     for d in $extraDirs; do
       mkdir -p "modsrc/$d"
       cp -a --reflink=auto "$coreSource/$d/." "modsrc/$d/"
+      chmod -R u+w "modsrc/$d"
     done
 
-    # store paths are read-only; modpost/modfinal must write into the tree
-    chmod -R u+w modsrc
     mkdir -p modsrc/a/b
 
     # KBUILD_EXTRA_SYMBOLS: run the core's modpost over the dependency
