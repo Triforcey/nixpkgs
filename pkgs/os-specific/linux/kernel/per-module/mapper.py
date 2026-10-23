@@ -620,13 +620,32 @@ class Mapper:
         keys = [k for k, _ in mod_files]
         refs = run_parallel(_scan_refs, [fs for _, fs in mod_files], 8)
         exported = set(sym2mods.keys())
+        # Noise filter: an exported symbol referenced by an implausible
+        # fraction of modules is a name collision (e.g. ib_core exports a
+        # symbol literally named "func" from a macro artifact), not a
+        # dependency. Dropping those edges only reduces over-approximation;
+        # under-approximation is confined to symbols that genuinely appear
+        # in nearly every module, which are meaningless as edges anyway.
+        threshold = max(10, len(keys) // 50)
+        ref_count = {}
+        for tokens in refs:
+            for t in tokens & exported:
+                ref_count[t] = ref_count.get(t, 0) + 1
+        noisy = {t for t, c in ref_count.items() if c > threshold}
+        if noisy:
+            self.warnings.append(
+                f"symbol noise filter: dropped {len(noisy)} colliding symbols "
+                f"(referenced by more than {threshold} modules)"
+            )
+        effective = exported - noisy
         for key, tokens in zip(keys, refs):
             deps = set()
-            for t in tokens & exported:
+            for t in tokens & effective:
                 for mk in sym2mods[t]:
                     if mk != key:
                         deps.add(mk)
             self.modules[key]["deps"] = sorted(deps)
+        self.noisySymbols = sorted(noisy)
 
     def run(self):
         self.process_file("", "Makefile")
@@ -690,6 +709,7 @@ def main():
         "stats": stats,
         "order": mapper.module_order,
         "modules": list(mapper.modules.values()),
+        "noisySymbols": getattr(mapper, "noisySymbols", []),
     }
     with open(outjson, "w") as f:
         json.dump(out, f, indent=1)

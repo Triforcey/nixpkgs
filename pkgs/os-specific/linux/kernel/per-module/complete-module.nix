@@ -60,7 +60,6 @@ stdenv.mkDerivation {
   buildPhase = ''
     runHook preBuild
 
-    coreSrc="$coreDev/lib/modules/${modDirVersion}/src"
     coreBuild="$coreDev/lib/modules/${modDirVersion}/build"
 
     # Recreate the compile drv's exact sandbox layout so the recorded

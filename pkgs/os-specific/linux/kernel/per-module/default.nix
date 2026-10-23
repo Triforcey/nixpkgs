@@ -62,7 +62,7 @@ let
     ];
 
   core = kernel.overrideAttrs (old: {
-    outputs = [ "out" "dev" "src" ];
+    outputs = [ "out" "dev" "source" ];
     buildFlags =
       [ kernel.target "scripts_gdb" ]
       ++ lib.optionals kernel.buildDTBs [ "dtbs" ];
@@ -72,8 +72,10 @@ let
       # tree (drivers are deleted there). Per-module compile drvs compile
       # against this tree, so they are consistent with the core by
       # construction and never need to re-apply kernel patches.
-      mkdir -p "${placeholder "src"}"
-      cp -a --reflink=auto "$PWD/source/." "${placeholder "src"}/"
+      # NB: the output is named "source", not "src" - an output named src
+      # would shadow the src attribute (env var) and break unpacking.
+      mkdir -p "${placeholder "source"}"
+      cp -a --reflink=auto "$PWD/source/." "${placeholder "source"}/"
     '';
   });
 
@@ -112,6 +114,7 @@ let
       # no symbol resolution below the final drv).
       env = {
         coreDev = "${core.dev}";
+        coreSource = "${core.source}";
         depsList = lib.concatMapStringsSep " " (p: "${p.drv}") presentDeps;
         depManifest = lib.concatStringsSep "\n" (
           map (p: "${p.name}\t${p.drv}") presentDeps
@@ -123,20 +126,19 @@ let
           copyExtra = lib.concatStringsSep "\n" (
             map (d: ''
               mkdir -p "modsrc/$(dirname "${d}")"
-              cp -a --reflink=auto "${core.src}/${d}" "modsrc/${d}"
+              cp -a --reflink=auto "$coreSource/${d}" "modsrc/${d}"
             '') extraDirs
           );
         in
         ''
           runHook preBuild
 
-          coreSrc="$coreDev/lib/modules/${modDirVersion}/src"
           coreBuild="$coreDev/lib/modules/${modDirVersion}/build"
 
           # stage 1 for exactly this module: sources in the canonical
           # in-tree layout, output written next to them by `make M=`
           mkdir -p "modsrc/$(dirname "${m.dir}")"
-          cp -a --reflink=auto "$coreSrc/${m.dir}" "modsrc/${m.dir}"
+          cp -a --reflink=auto "$coreSource/${m.dir}" "modsrc/${m.dir}"
           ${copyExtra}
 
           # compile only: the object target stops Kbuild right after the
