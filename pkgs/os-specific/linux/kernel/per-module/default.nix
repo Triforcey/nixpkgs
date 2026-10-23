@@ -64,8 +64,15 @@ let
   core = kernel.overrideAttrs (old: {
     outputs = [ "out" "dev" "source" ];
     buildFlags =
-      [ kernel.target "scripts_gdb" "scripts/module.lds" ]
+      [ kernel.target "scripts_gdb" ]
       ++ lib.optionals kernel.buildDTBs [ "dtbs" ];
+    postBuild = ''
+      # kernel 6.18+ generates scripts/module.lds only under
+      # modules_prepare (not run by the core-only build); downstream
+      # modpost/modfinal need it in the retained build tree. All prepare
+      # steps are up to date here, so this only generates the lds.
+      make "''${makeFlags[@]}" modules_prepare
+    '';
     installTargets = [ (kernel.installTargetFor kernel.target) ];
     preInstall = (old.preInstall or "") + ''
       # Stash files that this kernel's `make clean` (run by postInstall)
