@@ -115,19 +115,31 @@ stdenv.mkDerivation {
 
     # modules_install implies modules: modpost (this module only) + modfinal
     # link + modinst (kmodigest sign, compression, install, depmod maps).
-    # KBUILD_MODPOST_WARN=1: a module whose deps are not in the provided
-    # symvers gets warnings instead of errors - the undefined symbols are
-    # resolved at insmod time against the aggregated tree, which is the
-    # honest semantics for a drop-in artifact. Note that the build covers
-    # every =m module in the module's Kbuild dir, not just this one.
+    # Single-module FULL build via Kbuild's single-ko flow (make M=dir
+    # <name>.ko): it writes a one-entry modules.order in the make cwd,
+    # runs modpost (once, for exactly this module) and modfinal, then
+    # removes the temporary file. KBUILD_MODPOST_WARN=1: a module whose
+    # deps are not in the provided symvers gets warnings instead of
+    # errors - the undefined symbols are resolved at insmod time against
+    # the aggregated tree, which is the honest semantics for a drop-in
+    # artifact.
     make -C "$coreBuild" -j"$NIX_BUILD_CORES" \
       ${quotedFlags} \
       "KCFLAGS=-I$PWD/modsrc/a/b" \
       "KBUILD_MODPOST_WARN=1" \
       "M=$PWD/modsrc/${info.dir}" \
-      "INSTALL_MOD_PATH=$out" \
       "''${extraArgs[@]}" \
-      modules modules_install
+      "${info.name}.ko"
+
+    # Install exactly this module: modinst (sign/compress/install) reads
+    # MODORDER from the make cwd, so point it at a one-entry list.
+    echo "${info.name}.o" > "$coreBuild/modules.order"
+    make -C "$coreBuild" -j"$NIX_BUILD_CORES" \
+      ${quotedFlags} \
+      "M=$PWD/modsrc/${info.dir}" \
+      "INSTALL_MOD_PATH=$out" \
+      modules_install
+    rm -f "$coreBuild/modules.order"
 
     runHook postBuild
   '';
