@@ -184,9 +184,12 @@ let
         # exist with the object-only target, but filter defensively.
         mkdir -p "$out/self"
         cp -a --reflink=auto "modsrc/${m.dir}/." "$out/self/"
+        # NB: keep modules.order - Kbuild generates per-directory
+        # modules.order files in-tree, so it is both correct for the
+        # aggregate resume and required by the tier's MODORDER.
         find "$out/self" -type f \( \
           -name '*.mod.c' -o -name '*.mod.o' -o -name '*.ko' -o \
-          -name 'Module.symvers' -o -name 'modules.order' \
+          -name 'Module.symvers' \
         \) -delete
 
         # namespaced accumulation of dependencies (design principle 3)

@@ -99,7 +99,11 @@ stdenv.mkDerivation {
         fi
       done < "$compileDrv/dep-manifest.txt"
       if [ ''${#objlist[@]} -gt 0 ]; then
-        "$coreBuild/scripts/mod/modpost" -w -M extra.symvers "''${objlist[@]}" \
+        # -M enables the symvers dump, -o names it (-M is a boolean flag in
+        # Kbuild, not a filename option); -i feeds the core's vmlinux
+        # symvers to cut unresolved-symbol noise
+        "$coreBuild/scripts/mod/modpost" -w -M -o extra.symvers \
+          -i "$coreBuild/Module.symvers" "''${objlist[@]}" \
           || echo "warning: dep symvers extraction failed; continuing without it" >&2
       fi
     fi
@@ -117,7 +121,7 @@ stdenv.mkDerivation {
       "M=$PWD/modsrc/${info.dir}" \
       "INSTALL_MOD_PATH=$out" \
       "''${extraArgs[@]}" \
-      modules_install
+      modules modules_install
 
     runHook postBuild
   '';
