@@ -64,7 +64,7 @@ let
   core = kernel.overrideAttrs (old: {
     outputs = [ "out" "dev" "source" ];
     buildFlags =
-      [ kernel.target "scripts_gdb" ]
+      [ kernel.target "scripts_gdb" "scripts/module.lds" ]
       ++ lib.optionals kernel.buildDTBs [ "dtbs" ];
     installTargets = [ (kernel.installTargetFor kernel.target) ];
     preInstall = (old.preInstall or "") + ''
@@ -75,7 +75,13 @@ let
       #     '<module>.ko'"
       #   Module.symvers     - the core's vmlinux exports
       cp "$buildRoot/scripts/module.lds" "$NIX_BUILD_TOP/module.lds.stash" 2>/dev/null || true
-      cp "$buildRoot/Module.symvers" "$NIX_BUILD_TOP/Module.symvers.stash" 2>/dev/null || true
+      # without KBUILD_MODULES the vmlinux-only modpost writes
+      # vmlinux.symvers; downstream expects Module.symvers
+      if [ -f "$buildRoot/Module.symvers" ]; then
+        cp "$buildRoot/Module.symvers" "$NIX_BUILD_TOP/Module.symvers.stash"
+      elif [ -f "$buildRoot/vmlinux.symvers" ]; then
+        cp "$buildRoot/vmlinux.symvers" "$NIX_BUILD_TOP/Module.symvers.stash"
+      fi
       # Snapshot the full patched source before postInstall prunes the dev
       # tree (drivers are deleted there). Per-module compile drvs compile
       # against this tree, so they are consistent with the core by
