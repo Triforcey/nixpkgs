@@ -142,6 +142,9 @@ let
           mkdir -p "modsrc/$(dirname "${m.dir}")"
           cp -a --reflink=auto "$coreSource/${m.dir}" "modsrc/${m.dir}"
           ${copyExtra}
+          # store paths are read-only; the build must be able to write its
+          # artifacts next to the sources
+          chmod -R u+w modsrc
 
           # compile only: the object target stops Kbuild right after the
           # stage-1 build phase (objects + composite link + <mod>.mod).
@@ -253,6 +256,10 @@ let
         mkdir -p "$buildRoot/$modDir"
         cp -a "$modOut/self/." "$buildRoot/$modDir/"
       done < "$moduleManifest"
+
+      # store paths are read-only; the resumed build must be able to
+      # write .cmd files, generated artifacts, etc. next to the seeds
+      chmod -R u+w "$buildRoot"
 
       export KBUILD_NOCMDDEP=1
     '';

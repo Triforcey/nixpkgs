@@ -66,6 +66,8 @@ stdenv.mkDerivation {
     # command lines match and nothing is recompiled.
     mkdir -p "modsrc/$(dirname "${info.dir}")"
     cp -a --reflink=auto "$compileDrv/self/." "modsrc/${info.dir}/"
+    # store paths are read-only; modpost/modfinal must write into the tree
+    chmod -R u+w modsrc
     mkdir -p modsrc/a/b
 
     # KBUILD_EXTRA_SYMBOLS: run the core's modpost over the dependency
