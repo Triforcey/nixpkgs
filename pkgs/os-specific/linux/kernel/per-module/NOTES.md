@@ -161,6 +161,47 @@ insmod; the authoritative symvers is the final drv's).
   modulesTree }`) and must be called with its own argset.
 - `nix-instantiate --parse` passes for all new expressions.
 
+## Kernel-6.18-specific findings (smoke-test round trip)
+
+The smoke test against `pkgs.linux` (6.18.58, x86_64) surfaced a series of
+real integration bugs, each fixed with a commit:
+
+1. **Mapper source-dir detection**: after unpack, the tree root contains
+   `Documentation/` (which ships a Makefile); requiring both `Makefile`
+   and `Kbuild` fixed an empty map. (`ef2e0527`)
+2. **`lib.fix`**: `builtins.fix` does not exist. (`a1100ad`)
+3. **Output named `src` shadows the `src` attribute** (mkDerivation exposes
+   outputs as env vars) - renamed to `source`. (`0e57662`)
+4. **`rebuild-image.nix` is curried**; `callPackage` must be given its own
+   argset. (`f41d6dc`)
+5. **postInstall cwd**: genericBuild cd's into sourceRoot before install,
+   so the source snapshot must use absolute paths. (`b199244`)
+6. **Store paths are read-only**: every copied tree needs `chmod -R u+w`,
+   and copies that can overwrite earlier ones need it between copies.
+   (`f153931`, `bc3ed4b`)
+7. **Relative includes escaping the module dir** (8250 modules including
+   `../serial_mctrl_gpio.h`): the mapper walks include chains
+   breadth-first over `.c/.h/.S/.rs` files and emits per-module
+   `extraDirs`; only includes whose target file exists in the source tree
+   are recorded (quoted `asm/...` includes resolved via -I would produce
+   phantom directories). Copies use the `SRC/.` contents form because
+   module dirs live *inside* their extra dirs. (`5f3256d`, `14ca492`,
+   `5ce25c2`)
+8. **Tier**: Kbuild's native single-module full build is
+   `make M=<dir> <module>.ko` (the `single_modules` flow writes a
+   one-entry `modules.order`, runs modpost for exactly that module and
+   modfinal); install then points modinst's MODORDER at a one-entry list.
+   `KBUILD_MODPOST_WARN=1` is honest for drop-in modules (unresolved
+   symbols resolve at insmod). (`90b6c99`, `c163019`)
+9. **Core must retain the module-linking interface**: kernel 6.18
+   generates `scripts/module.lds` only under `modules_prepare` (not run
+   by the core-only build) and the vmlinux-only modpost writes
+   `vmlinux.symvers` instead of `Module.symvers`. Without `module.lds`,
+   make rejects the `%.ko` pattern rule and fails with
+   `No rule to make target '<module>.ko'` - a wonderful error message for
+   a missing linker script. The core now builds `scripts/module.lds`
+   explicitly and stashes/restores both files. (`340db0d`, `ded7283`)
+
 ## In progress (smoke chain on nixbuild, detached)
 
 The chain (`smoke-chain.sh`) waits for the core drv, then builds:
