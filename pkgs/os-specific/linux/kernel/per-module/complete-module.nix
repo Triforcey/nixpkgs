@@ -115,9 +115,15 @@ stdenv.mkDerivation {
 
     # modules_install implies modules: modpost (this module only) + modfinal
     # link + modinst (kmodigest sign, compression, install, depmod maps).
+    # KBUILD_MODPOST_WARN=1: a module whose deps are not in the provided
+    # symvers gets warnings instead of errors - the undefined symbols are
+    # resolved at insmod time against the aggregated tree, which is the
+    # honest semantics for a drop-in artifact. Note that the build covers
+    # every =m module in the module's Kbuild dir, not just this one.
     make -C "$coreBuild" -j"$NIX_BUILD_CORES" \
       ${quotedFlags} \
       "KCFLAGS=-I$PWD/modsrc/a/b" \
+      "KBUILD_MODPOST_WARN=1" \
       "M=$PWD/modsrc/${info.dir}" \
       "INSTALL_MOD_PATH=$out" \
       "''${extraArgs[@]}" \
@@ -128,6 +134,11 @@ stdenv.mkDerivation {
 
   installPhase = ''
     runHook preInstall
+    # The build covers every =m module in the Kbuild dir; keep only the
+    # requested module's drop-in files (.ko*, including its .ko.cer).
+    find "$out/lib/modules/${modDirVersion}/kernel" -type f \
+      ! -name '${info.name}.ko*' -delete
+    find "$out/lib/modules/${modDirVersion}/kernel" -type d -empty -delete
     # depmod maps at the tree root collide with the kernel modules tree in
     # aggregateModules; the aggregator regenerates them itself.
     rm -f "$out/lib/modules/${modDirVersion}"/modules.*
