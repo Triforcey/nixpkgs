@@ -164,11 +164,12 @@ stdenv.mkDerivation {
 
   installPhase = ''
     runHook preInstall
-    # The build covers every =m module in the Kbuild dir; keep only the
-    # requested module's drop-in files (.ko*, including its .ko.cer).
-    find "$out/lib/modules/${modDirVersion}/kernel" -type f \
-      ! -name '${info.name}.ko*' -delete
-    find "$out/lib/modules/${modDirVersion}/kernel" -type d -empty -delete
+    # External M= installs land under updates/ (shadows the in-tree
+    # module of the same name - the intended drop-in semantics). The
+    # build covers every =m module in the Kbuild dir; keep only the
+    # requested module's files (.ko*, including its .ko.cer).
+    find "$out/lib/modules/${modDirVersion}" -type f \
+      ! -name '${info.name}.ko*' ! -name 'modules.*' -delete
     # depmod maps at the tree root collide with the kernel modules tree in
     # aggregateModules; the aggregator regenerates them itself.
     rm -f "$out/lib/modules/${modDirVersion}"/modules.*
