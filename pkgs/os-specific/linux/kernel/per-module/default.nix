@@ -314,7 +314,10 @@ let
   # Final kernel image: reuses upstream's rebuild-image machinery
   # (insert-sys-cert with the aggregate's merged modules.cer).
   image = (callPackage ../rebuild-image.nix { kernel = aggregate; }) {
-    modulesTree = aggregate;
+    # the modules tree lives in the aggregate's modules output; the
+    # default output (out) is empty (the aggregate only runs
+    # modules_install)
+    modulesTree = aggregate.modules;
   };
 
   # Module-level tier: per-module COMPLETE build (drop-in .ko + .ko.cer),
