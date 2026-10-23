@@ -209,7 +209,7 @@ let
 
   # fixpoint-by-name: each module references its dependencies by name and
   # expects the same mapper to produce them; Nix dedups identical drvs.
-  modules = builtins.fix (
+  modules = lib.fix (
     self: builtins.listToAttrs (
       map (m: lib.nameValuePair m.name (mkCompileModule self m)) selected
     )
