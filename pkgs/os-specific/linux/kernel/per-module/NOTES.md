@@ -202,18 +202,56 @@ real integration bugs, each fixed with a commit:
    a missing linker script. The core now builds `scripts/module.lds`
    explicitly and stashes/restores both files. (`340db0d`, `ded7283`)
 
-## In progress (smoke chain on nixbuild, detached)
+## Smoke chain verification (kernel 6.18.58, x86_64, nixbuild.net)
 
-The chain (`smoke-chain.sh`) waits for the core drv, then builds:
-1. the 5 subset compile-only module drvs,
-2. the module-level tiers for `9p` (with real deps 9pnet/netfs) and
-   `nls_cp437` (leaf),
-3. the subset aggregate (seeds 5 modules' stage-1 artifacts; the resumed
-   `make modules` compiles the remaining ~7285 in the final drv — a
-   complete, correct kernel) and the rebuild-image over it
-   (insert-sys-cert with the merged modules.cer).
+The chain ran end-to-end against `pkgs.linux` (6.18.58) with the subset
+`onlyModules = [ 9p 9pnet netfs nls_cp437 8250_pci ]`:
 
-Timings will be recorded in the final report.
+1. **Core drv** built (~3.5 min build phase on nixbuild big-parallel;
+   ~10 min wall including install/fixup and the 2.2 GB copy-back). The dev
+   build tree retains the full module-linking interface (modpost, fixdep,
+   module.lds, Module.symvers) and the `source` output carries the full
+   patched tree.
+2. **Compile-only module drvs** (5/5 built, ~1-2 min each): stage-1
+   artifacts only - composite `.o`, constituents, `.mod`, `.*.cmd` - with
+   zero stage-2 outputs (no `.ko`, no `.mod.c`) and namespaced dep
+   accumulation.
+3. **Module-level tiers** (2/2 built, ~1-2 min each): the full modinst
+   flow ran - STRIP, kmodigest SIGN, XZ - producing drop-in artifacts
+   `updates/<name>.ko.xz` + `<name>.ko.cer` (260-byte kmodigest cert,
+   ready for `aggregateModules` cert merging).
+4. **Aggregate drv** (~35-40 min: built-ins rebuild + resumed compile of
+   the ~7285 non-subset modules + global modpost + per-module ld +
+   modinst + cert merge + depmod): the modules output contains 7294
+   compressed modules, `modules.order` (7294 lines), depmod maps
+   (`modules.dep`, `modules.alias`), and `modules.cer` = 1 896 440 bytes
+   (all per-module certs merged, per-module files removed - the upstream
+   invariant).
+5. **Image drv** (~4 min): `scripts/insert-sys-cert` logged
+   `Inserted the contents of .../modules.cer into ffffffff83b1dcc8` - the
+   merged cert bundle embedded into the stamped vmlinux, bzImage relinked
+   (14.6 MB) and System.map installed.
+
+### Aggregate resume efficiency finding
+
+The aggregate's resumed build recompiled *everything*, not just the
+non-subset modules. Two causes, both fixable (deferred - correctness is
+unaffected; the result is a complete, correct kernel):
+
+1. Per-dir `built-in.a` archives (and their `.cmd` files) are pruned from
+   the core dev build tree, and 6.18's `make modules` descends into all
+   dirs with `need-builtin=1`, so missing archives force a built-in
+   rebuild. Fix: preserve per-dir `built-in.a` + `.cmd` in the core dev
+   tree (same stash/restore pattern as module.lds).
+2. The aggregate's `configurePhase` runs `make oldconfig`, which
+   regenerates `include/config/auto.conf` and the generated headers with
+   *current* timestamps - newer than the epoch-timestamped stage-1
+   artifacts, so `newer-prereqs` triggers a full rebuild even under
+   `KBUILD_NOCMDDEP=1`. Fix: seed the build tree before configurePhase,
+   or refresh artifact mtimes after configuration.
+
+With both fixed, the resumed aggregate should compile only the missing
+modules - making the subset mode a true incremental build.
 
 ## Known deviations from the agreed design
 
