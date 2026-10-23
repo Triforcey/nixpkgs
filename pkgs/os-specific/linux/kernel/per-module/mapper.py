@@ -608,30 +608,50 @@ class Mapper:
 
     def detect_extra_dirs(self):
         """Modules may include headers outside their own directory via
-        relative paths (e.g. ../serial_mctrl_gpio.h). The compile drv only
-        copies the module dir, so record every in-tree directory that must
-        also be copied for the includes to resolve. Over-approximation is
-        safe (extra copied sources)."""
+        relative paths (e.g. 8250.h including ../serial_mctrl_gpio.h). The
+        compile drv only copies the module dir, so record every in-tree
+        directory whose files must also be copied for the includes to
+        resolve. Walk breadth-first from the module dir: files in a newly
+        discovered dir may themselves escape (capped for safety).
+        Over-approximation is safe (extra copied sources)."""
         inc_re = re.compile(r'#\s*include\s+"([^"]+)"')
+        max_depth = 4
         for m in self.modules.values():
-            extras = set()
-            for src in m["sources"]:
-                srcdir = os.path.dirname(src)
-                try:
-                    with open(os.path.join(self.srcdir, src), errors="replace") as f:
-                        text = f.read()
-                except OSError:
-                    continue
-                for mm in inc_re.finditer(text):
-                    inc = mm.group(1)
-                    if inc.startswith("/"):
+            base = m["dir"]
+            seen_dirs = {base}
+            frontier = [base]
+            for _ in range(max_depth):
+                nxt = []
+                for d in frontier:
+                    dpath = os.path.join(self.srcdir, d)
+                    try:
+                        names = os.listdir(dpath)
+                    except OSError:
                         continue
-                    target = os.path.normpath(os.path.join(srcdir, inc))
-                    if target != m["dir"] and not target.startswith(m["dir"] + os.sep):
-                        d = os.path.dirname(target)
-                        if d and d != m["dir"]:
-                            extras.add(d)
-            m["extraDirs"] = sorted(extras)
+                    for fn in names:
+                        if not fn.endswith((".c", ".h", ".S", ".rs", ".i", ".s")):
+                            continue
+                        rel = os.path.normpath(os.path.join(d, fn))
+                        try:
+                            with open(os.path.join(self.srcdir, rel), errors="replace") as f:
+                                text = f.read()
+                        except OSError:
+                            continue
+                        for mm in inc_re.finditer(text):
+                            inc = mm.group(1)
+                            if inc.startswith("/"):
+                                continue
+                            target = os.path.normpath(os.path.join(d, inc))
+                            if target == base or target.startswith(base + os.sep):
+                                continue
+                            td = os.path.dirname(target)
+                            if td and td not in seen_dirs:
+                                seen_dirs.add(td)
+                                nxt.append(td)
+                if not nxt:
+                    break
+                frontier = nxt
+            m["extraDirs"] = sorted(seen_dirs - {base})
 
     def scan_exports_and_deps(self):
         mod_files = [(m["key"], [os.path.join(self.srcdir, s) for s in m["sources"]]) for m in self.modules.values()]
