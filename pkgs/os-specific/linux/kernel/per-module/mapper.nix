@@ -28,8 +28,18 @@ stdenvNoCC.mkDerivation {
   buildPhase = ''
     runHook preBuild
 
-    srcdir=$(find . -maxdepth 1 -mindepth 1 -type d | head -n1)
-    test -f "$srcdir/Makefile" || { echo "no kernel source found"; exit 1; }
+    # Pick the unpacked kernel tree: a directory containing both Makefile
+    # and Kbuild (Documentation also ships a Makefile, so the first dir
+    # found is not good enough).
+    srcdir=""
+    for d in */ .; do
+      if [ -f "$d/Makefile" ] && [ -f "$d/Kbuild" ]; then
+        srcdir="$d"
+        break
+      fi
+    done
+    test -n "$srcdir" || { echo "no kernel source found"; exit 1; }
+    echo "mapping kernel source in $srcdir"
 
     python3 ${./mapper.py} "$srcdir" "$configfile" "$arch" modules.json warnings.txt
 
