@@ -113,12 +113,28 @@ insmod; the authoritative symvers is the final drv's).
   - 4 missing (`iommu_{amdv1,riscv64,vtdss,x86_64}`) — these modules are
     generated at make time via `$(eval $(foreach …))` in
     `drivers/iommu/generic_pt/fmt/Makefile`; a source-level walker cannot
-    see them. Conservative mitigation available: list them via
-    `onlyModules`-adjacent extension or accept the final drv building them
-    (it does — see resume semantics).
+    see them. The final drv still builds them (resume semantics).
   - 1 extra (`sparx5_serdes`) — same drift class, over-approximation = safe.
   - Mapper runtime: ~2.6 s CPU for the whole tree (this is why the map is a
     derivation rather than pure-Nix Makefile parsing; IFD documents itself).
+- **Mapper through Nix (kernel 6.18.58, x86_64, nixos default config)**:
+  the map derivation builds on nixbuild in ~90 s (dominated by source
+  unpack; the scan itself is ~3 s CPU) and yields **7290 modules**
+  (`stats` in `modules.json`), arch `x86_64`, with 822 warnings recorded.
+- **Dependency-edge quality**: the EXPORT_SYMBOL scan initially produced
+  module-wide spurious edges from name-colliding exports (e.g. `ib_core`
+  exports a symbol literally named `func` — a macro artifact — and every
+  module containing the identifier `func` then depended on `ib_core`).
+  A noise filter drops symbols referenced by more than
+  `max(10, n_modules/50)` modules and reports them as `noisySymbols`
+  (10 on 6.18.58, 8 on 7.3). After filtering: `9p → [9pnet, netfs]`,
+  `9pnet → [netfs]`, `mac80211 → [cfg80211, libarc4]` — real chains.
+- **Eval wiring**: `nix-instantiate --eval` of the packager succeeds through
+  the IFD chain (linux-config → map → 7290-entry fixpoint attrset
+  creation). Practical IFD note: `nix-instantiate --eval` cannot
+  instantiate a *new* map `.drv` mid-eval (`path … is not valid`); build
+  the map drv explicitly first (`nix-build map-drv.nix`) and later evals
+  resolve from the store.
 - **Stage-1 mechanics** (local, kernel 7.3 arm64 dev tree): the
   compile-only invocation
   `make -C <kernel.dev build tree> M=<writable modsrc> KCFLAGS=-I<pwd>/modsrc/a/b msm.o`
@@ -134,15 +150,29 @@ insmod; the authoritative symvers is the final drv's).
     pruned `kernel.dev` source lacks them → the two-level probe dir
     `modsrc/a/b` makes `-I$PWD/modsrc/a/b` resolve them (`X/../../ ==
     modsrc`).
+- **Derivation instantiation**: the core drv, 5 subset compile-only drvs
+  (`onlyModules = [ 9p 9pnet netfs nls_cp437 8250_pci ]`), 2 module-level
+  tiers, the aggregate and the image all instantiate.
+- Two derivation-construction bugs were caught exactly where the design
+  says they would be: (a) naming the core's source-snapshot output `src`
+  shadows the `src` attribute (mkDerivation exposes outputs as env vars;
+  the build tried to "unpack" the empty output) — renamed to `source`;
+  (b) `rebuild-image.nix` is curried (`{ lib, kernel }` → `{ target,
+  modulesTree }`) and must be called with its own argset.
 - `nix-instantiate --parse` passes for all new expressions.
 
-## Not yet verified / deferred (smoke test in progress)
+## In progress (smoke chain on nixbuild, detached)
 
-- Core drv build (~30–60 min on nixbuild, running detached).
-- Targeted compile-only builds of real modules through Nix.
-- Module-level tier (`completeModule`) end-to-end incl. `.ko.cer`.
-- Aggregate (subset via `onlyModules`) + image with merged certs.
-- Full-set eval/instantiation of ~8000 module drvs (eval memory/time).
+The chain (`smoke-chain.sh`) waits for the core drv, then builds:
+1. the 5 subset compile-only module drvs,
+2. the module-level tiers for `9p` (with real deps 9pnet/netfs) and
+   `nls_cp437` (leaf),
+3. the subset aggregate (seeds 5 modules' stage-1 artifacts; the resumed
+   `make modules` compiles the remaining ~7285 in the final drv — a
+   complete, correct kernel) and the rebuild-image over it
+   (insert-sys-cert with the merged modules.cer).
+
+Timings will be recorded in the final report.
 
 ## Known deviations from the agreed design
 
