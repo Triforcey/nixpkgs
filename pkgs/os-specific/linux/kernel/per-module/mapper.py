@@ -644,6 +644,12 @@ class Mapper:
                             target = os.path.normpath(os.path.join(d, inc))
                             if target == base or target.startswith(base + os.sep):
                                 continue
+                            # Only copy directories for includes that resolve
+                            # to an existing file in the source tree; quoted
+                            # includes that exist nowhere (generated headers,
+                            # asm/... resolved via -I) need no copy.
+                            if not os.path.exists(os.path.join(self.srcdir, target)):
+                                continue
                             td = os.path.dirname(target)
                             if td and td not in seen_dirs:
                                 seen_dirs.add(td)
