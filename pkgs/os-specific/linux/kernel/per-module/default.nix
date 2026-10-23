@@ -74,8 +74,10 @@ let
       # construction and never need to re-apply kernel patches.
       # NB: the output is named "source", not "src" - an output named src
       # would shadow the src attribute (env var) and break unpacking.
+      # NB2: use the absolute path; after unpack genericBuild has cd'd into
+      # sourceRoot, so $PWD is already .../source.
       mkdir -p "${placeholder "source"}"
-      cp -a --reflink=auto "$PWD/source/." "${placeholder "source"}/"
+      cp -a --reflink=auto "$dev/lib/modules/${modDirVersion}/source/." "${placeholder "source"}/"
     '';
   });
 
