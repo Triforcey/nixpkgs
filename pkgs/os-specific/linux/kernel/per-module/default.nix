@@ -132,8 +132,8 @@ let
         let
           copyExtra = lib.concatStringsSep "\n" (
             map (d: ''
-              mkdir -p "modsrc/$(dirname "${d}")"
-              cp -a --reflink=auto "$coreSource/${d}" "modsrc/${d}"
+              mkdir -p "modsrc/${d}"
+              cp -a --reflink=auto "$coreSource/${d}/." "modsrc/${d}/"
             '') extraDirs
           );
         in
@@ -144,8 +144,10 @@ let
 
           # stage 1 for exactly this module: sources in the canonical
           # in-tree layout, output written next to them by `make M=`
-          mkdir -p "modsrc/$(dirname "${m.dir}")"
-          cp -a --reflink=auto "$coreSource/${m.dir}" "modsrc/${m.dir}"
+          mkdir -p "modsrc/${m.dir}"
+          # contents form: the destination may already exist (module dirs
+          # nested inside extraDirs); cp -a SRC DST would nest otherwise
+          cp -a --reflink=auto "$coreSource/${m.dir}/." "modsrc/${m.dir}/"
           ${copyExtra}
           # store paths are read-only; the build must be able to write its
           # artifacts next to the sources

@@ -76,8 +76,8 @@ stdenv.mkDerivation {
       esac
     done < "$compileDrv/manifest.txt"
     for d in $extraDirs; do
-      mkdir -p "modsrc/$(dirname "$d")"
-      cp -a --reflink=auto "$coreSource/$d" "modsrc/$d"
+      mkdir -p "modsrc/$d"
+      cp -a --reflink=auto "$coreSource/$d/." "modsrc/$d/"
     done
 
     # store paths are read-only; modpost/modfinal must write into the tree
