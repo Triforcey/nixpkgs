@@ -295,6 +295,9 @@ let
       # remaining rebuild triggers are only missing artifacts - which make
       # then builds here (correct, just not per-module cached).
       cp -a "$coreDev/lib/modules/${modDirVersion}/build/." "$buildRoot/"
+      # the copied tree carries store-path permissions (read-only); make
+      # it writable BEFORE seeding module artifacts into it
+      chmod -R u+w "$buildRoot"
 
       while IFS=$'\t' read -r modOut modDir modName; do
         [ -n "$modOut" ] || continue
@@ -302,8 +305,6 @@ let
         cp -a "$modOut/self/." "$buildRoot/$modDir/"
       done < "$moduleManifest"
 
-      # store paths are read-only; the resumed build must be able to
-      # write .cmd files, generated artifacts, etc. next to the seeds
       chmod -R u+w "$buildRoot"
 
       export KBUILD_NOCMDDEP=1
