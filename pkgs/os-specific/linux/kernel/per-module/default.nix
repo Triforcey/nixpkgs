@@ -313,12 +313,24 @@ let
 
   # Final kernel image: reuses upstream's rebuild-image machinery
   # (insert-sys-cert with the aggregate's merged modules.cer).
-  image = (callPackage ../rebuild-image.nix { kernel = aggregate; }) {
+  image = ((callPackage ../rebuild-image.nix { kernel = aggregate; }) {
     # the modules tree lives in the aggregate's modules output; the
     # default output (out) is empty (the aggregate only runs
     # modules_install)
     modulesTree = aggregate.modules;
-  };
+  }).overrideAttrs (old: {
+    # the inherited installFlags point INSTALL_PATH at the aggregate's
+    # out output - a read-only store path in this drv's sandbox. Install
+    # the rebuilt image directly (the make install target only copies
+    # KBUILD_IMAGE and System.map to INSTALL_PATH).
+    installPhase = ''
+      runHook preInstall
+      mkdir -p $out
+      install -Dm644 arch/x86/boot/bzImage $out/${kernel.target}
+      install -Dm644 System.map $out/System.map
+      runHook postInstall
+    '';
+  });
 
   # Module-level tier: per-module COMPLETE build (drop-in .ko + .ko.cer),
   # resuming the compile-only drv's stage-1 artifacts.
