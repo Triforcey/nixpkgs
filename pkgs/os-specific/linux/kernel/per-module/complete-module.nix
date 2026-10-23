@@ -63,6 +63,16 @@ stdenv.mkDerivation {
 
     coreBuild="$coreDev/lib/modules/${modDirVersion}/build"
 
+    # Writable copy of the core build tree: the store path is read-only,
+    # and the single-ko flow writes modules.order into make's cwd (which
+    # -C points at the build tree). Reflink keeps the copy cheap; the
+    # generated shim is repointed at the copy so kbuild does not re-exec
+    # into the read-only original.
+    buildTree="$PWD/kbuild"
+    cp -a --reflink=auto "$coreBuild/." "$buildTree/"
+    chmod -R u+w "$buildTree"
+    sed -i "s|^export KBUILD_OUTPUT.*|export KBUILD_OUTPUT = $buildTree|" "$buildTree/Makefile"
+
     # Recreate the compile drv's exact sandbox layout so the recorded
     # command lines match and nothing is recompiled.
     mkdir -p "modsrc/$(dirname "${info.dir}")"
@@ -103,8 +113,8 @@ stdenv.mkDerivation {
         # -M enables the symvers dump, -o names it (-M is a boolean flag in
         # Kbuild, not a filename option); -i feeds the core's vmlinux
         # symvers to cut unresolved-symbol noise
-        "$coreBuild/scripts/mod/modpost" -w -M -o extra.symvers \
-          -i "$coreBuild/Module.symvers" "''${objlist[@]}" \
+        "$buildTree/scripts/mod/modpost" -w -M -o extra.symvers \
+          -i "$buildTree/Module.symvers" "''${objlist[@]}" \
           || echo "warning: dep symvers extraction failed; continuing without it" >&2
       fi
     fi
@@ -124,7 +134,7 @@ stdenv.mkDerivation {
     # errors - the undefined symbols are resolved at insmod time against
     # the aggregated tree, which is the honest semantics for a drop-in
     # artifact.
-    make -C "$coreBuild" -j"$NIX_BUILD_CORES" \
+    make -C "$buildTree" -j"$NIX_BUILD_CORES" \
       ${quotedFlags} \
       "KCFLAGS=-I$PWD/modsrc/a/b" \
       "KBUILD_MODPOST_WARN=1" \
@@ -134,7 +144,7 @@ stdenv.mkDerivation {
 
     # Install exactly this module: modinst (sign/compress/install) reads
     # MODORDER from the make cwd, so point it at a one-entry list.
-    echo "${info.name}.o" > "$coreBuild/modules.order"
+    echo "${info.name}.o" > "$buildTree/modules.order"
     make -C "$coreBuild" -j"$NIX_BUILD_CORES" \
       ${quotedFlags} \
       "M=$PWD/modsrc/${info.dir}" \
