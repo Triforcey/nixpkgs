@@ -30,7 +30,9 @@ compile-only drv's artifacts instead of recompiling.
   `obj-*` and generic `*-y` vars, including `core-y`/`drivers-y`/`libs-y`
   wired by the arch Makefile), expands `obj-$(CONFIG_FOO)` against the
   shipped `.config`, collects the =m module set with object lists, and
-  derives module→module edges from a conservative EXPORT_SYMBOL scan.
+  derives module→module edges from a conservative EXPORT_SYMBOL scan,
+  pruned to a DAG at map time (default.nix interpolates dep store paths
+  into the compile drvs' env; a cyclic graph recurses forever at eval).
 - `mapper.nix` — the map derivation (IFD'd at eval time).
 - `default.nix` — core / module fixpoint / aggregate / image wiring.
 - `complete-module.nix` — module-level complete-build tier.
@@ -84,8 +86,9 @@ if-changed-cond = $(newer-prereqs)$(cmd-check)$(check-FORCE)
 Under Nix epoch timestamps `newer-prereqs` is empty, so the remaining
 rebuild triggers are *missing artifacts only* — make then builds them in
 the aggregate (correct, just not per-module cached). This makes the
-aggregate degrade gracefully: a subset build (`onlyModules`) still produces
-a complete, correct kernel; the per-module caching applies to the subset.
+aggregate degrade gracefully: even if per-module drvs are missing from the
+store, the resumed `make modules` compiles the gaps, so the result is
+always a complete, correct kernel.
 
 The kernel image is built by the untouched upstream `rebuild-image.nix`
 (`insert-sys-cert -b vmlinux -c modules.cer`, `--assume-old=vmlinux`).
@@ -151,8 +154,9 @@ insmod; the authoritative symvers is the final drv's).
     `modsrc/a/b` makes `-I$PWD/modsrc/a/b` resolve them (`X/../../ ==
     modsrc`).
 - **Derivation instantiation**: the core drv, 5 subset compile-only drvs
-  (`onlyModules = [ 9p 9pnet netfs nls_cp437 8250_pci ]`), 2 module-level
-  tiers, the aggregate and the image all instantiate.
+  (`onlyModules = [ 9p 9pnet netfs nls_cp437 8250_pci ]` — flag since
+  removed, see finding 11), 2 module-level tiers, the aggregate and the
+  image all instantiate.
 - Two derivation-construction bugs were caught exactly where the design
   says they would be: (a) naming the core's source-snapshot output `src`
   shadows the `src` attribute (mkDerivation exposes outputs as env vars;
@@ -201,6 +205,23 @@ real integration bugs, each fixed with a commit:
    `No rule to make target '<module>.ko'` - a wonderful error message for
    a missing linker script. The core now builds `scripts/module.lds`
    explicitly and stashes/restores both files. (`340db0d`, `ded7283`)
+10. **Full-mode fixpoint recursion**: removing the subset and forcing every
+   compile drv (the aggregate's `moduleManifest` input) hit
+   `error: infinite recursion` at `env.depManifest` - the full dep graph
+   is not a DAG: 31 name-level self-edges (duplicate registrations of one
+   module name) plus 13 real SCCs (e.g. `nfsv3` ↔ `nfsv4`, `usbhid` ↔ `hid`)
+   in the 7290-module 6.18 map. The 5-module smoke subset was acyclic by
+   luck. Fix: `Mapper.prune_cycles` projects the edges onto module NAMES
+   (the fixpoint's actual key granularity), drops name self-edges, and
+   breaks SCCs deterministically by registration order. Dropped edges
+   only narrow the tier's `KBUILD_EXTRA_SYMBOLS` (already best-effort);
+   the aggregate and image are unaffected.
+11. **Subset mode removed**: `onlyModules` saved nothing in any cache state
+   (the aggregate recompiles uncovered modules internally), and the
+   subset's module manifest *changed the aggregate's drv identity*,
+   fragmenting the one drv that matters for cache reuse. Full mode is the
+   only mode; cheap smoke testing is done by building individual module
+   drvs / the tier, not by a subset flag.
 
 ## Smoke chain verification (kernel 6.18.58, x86_64, nixbuild.net)
 
@@ -251,7 +272,7 @@ unaffected; the result is a complete, correct kernel):
    or refresh artifact mtimes after configuration.
 
 With both fixed, the resumed aggregate should compile only the missing
-modules - making the subset mode a true incremental build.
+modules - making a partial cache state a true incremental build.
 
 ## Known deviations from the agreed design
 
@@ -263,9 +284,6 @@ modules - making the subset mode a true incremental build.
   source) so module sources are patch-consistent with the core by
   construction and module drvs never re-apply kernel patches. Cost: one
   ~1.4 GB store path per kernel, shared by all module drvs.
-- `onlyModules` subset mode exists so the aggregate can be smoke-tested
-  cheaply; the result remains a complete kernel (resume semantics fill in
-  the rest).
 
 ## Known limitations
 
@@ -279,6 +297,10 @@ modules - making the subset mode a true incremental build.
 - The aggregate's dev output re-runs upstream's postInstall pruning, so
   the resumed build tree is not retained there; the per-module artifacts
   remain in the module drvs.
+- Full mode only. A subset mode (`onlyModules`) existed for cheap smoke
+  tests, but it saved nothing in any cache state (the aggregate recompiles
+  uncovered modules internally) and its manifest changed the aggregate's
+  drv identity, so it was removed (finding 10/11 above).
 
 ## Usage
 
@@ -288,7 +310,6 @@ let
   pm = pkgs.callPackage ./pkgs/os-specific/linux/kernel/per-module {
     kernel = pkgs.linux;                # any kernel package
     kernelModuleMakeFlags = pkgs.linuxPackages.kernelModuleMakeFlags;
-    # onlyModules = [ "msm" "8250" ];   # optional subset for fast iteration
   };
 in
 {

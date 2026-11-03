@@ -5,7 +5,9 @@
 # variables, including core-y/drivers-y/libs-y wired by the arch Makefile),
 # expands `obj-$(CONFIG_FOO)` against the shipped .config, collects the =m
 # module set with their object lists, and derives module->module dependency
-# edges from a conservative EXPORT_SYMBOL scan.
+# edges from a conservative EXPORT_SYMBOL scan, pruned to a DAG (the
+# per-module fixpoint interpolates dep store paths; cycles would recurse
+# forever - see Mapper.prune_cycles).
 #
 # Design constraints (see NOTES.md):
 #   * Over-approximation is safe (costs a spurious rebuild edge).
@@ -699,6 +701,146 @@ class Mapper:
                         deps.add(mk)
             self.modules[key]["deps"] = sorted(deps)
         self.noisySymbols = sorted(noisy)
+        self.prune_cycles()
+
+    def prune_cycles(self):
+        """The per-module fixpoint in default.nix interpolates dep *store
+        paths* into each compile drv's env, so the dep graph must be a DAG:
+        a cycle makes drv construction infinitely recursive (the 5-module
+        smoke subset was acyclic by luck; the full 7290-module set is not).
+
+        Eval-time granularity is the module NAME, not the map key: the
+        fixpoint keys drvs by name (for duplicate registrations of one
+        name the last twin wins) and resolves each dep key with
+        self.${dep} - a plain key is a name and resolves, a name@dir key
+        does not resolve at all (null, dropped). The graph that must be
+        a DAG is the projection of dep edges onto names.
+
+        Two classes of cycle exist in that projection and both are pruned:
+        - name self-edges: a dep key whose name half equals the depender's
+          own name (duplicate registrations of one module name). Key-level
+          these are edges between distinct twins; name-level they are
+          self-references and recurse on their own.
+        - real multi-node SCCs in the name graph (e.g. nfsv3 <-> nfsv4,
+          usbhid <-> hid). Broken deterministically by registration
+          order: within an SCC only edges from a lower-order to a strictly
+          higher-order name are kept.
+
+        Cost: dropped edges only narrow the module-level tier's
+        KBUILD_EXTRA_SYMBOLS, which is best-effort by design (modpost warns,
+        symbols resolve at insmod, the authoritative symvers is the
+        aggregate's global modpost). The aggregate and the image are
+        unaffected. Unresolvable name@dir dep keys stay in each module's
+        dep list (consumers drop them); they cannot contribute cycles."""
+        def name_of(k):
+            return k.split("@", 1)[0]
+
+        # deterministic name order = first registration
+        names = {}
+        for key in self.module_order:
+            nm = self.modules[key]["name"]
+            if nm not in names:
+                names[nm] = len(names)
+
+        # name-level graph: union of resolvable dep edges over twins
+        graph = {nm: set() for nm in names}
+        self_edges = []
+        for key, m in self.modules.items():
+            nm = m["name"]
+            for d in m["deps"]:
+                if "@" in d:
+                    continue  # self."name@dir" is null in the fixpoint
+                dn = name_of(d)
+                if dn == nm:
+                    self_edges.append((key, d))
+                    continue
+                if dn in names:
+                    graph[nm].add(dn)
+        if self_edges:
+            self.warnings.append(
+                f"cycle prune: dropped {len(self_edges)} name self-edges "
+                "(duplicate module registrations): "
+                + ", ".join(f"{a} -> {b}" for a, b in self_edges)
+            )
+
+        # iterative Tarjan SCC over the name graph
+        idx, low = {}, {}
+        on = set()
+        stack = []
+        counter = 0
+        sccs = []
+        for start in graph:
+            if start in idx:
+                continue
+            work = [(start, iter(sorted(graph[start])))]
+            idx[start] = low[start] = counter
+            counter += 1
+            stack.append(start)
+            on.add(start)
+            while work:
+                v, it = work[-1]
+                advanced = False
+                for w in it:
+                    if w not in idx:
+                        idx[w] = low[w] = counter
+                        counter += 1
+                        stack.append(w)
+                        on.add(w)
+                        work.append((w, iter(sorted(graph[w]))))
+                        advanced = True
+                        break
+                    elif w in on and idx[w] < low[v]:
+                        low[v] = idx[w]
+                if advanced:
+                    continue
+                work.pop()
+                if low[v] == idx[v]:
+                    scc = []
+                    while True:
+                        w = stack.pop()
+                        on.discard(w)
+                        scc.append(w)
+                        if w == v:
+                            break
+                    sccs.append(scc)
+                if work:
+                    pv = work[-1][0]
+                    if low[v] < low[pv]:
+                        low[pv] = low[v]
+
+        scc_of = {}
+        for i, scc in enumerate(sccs):
+            for nm in scc:
+                scc_of[nm] = i
+
+        # break each multi-node SCC by name registration order
+        dropped = []
+        for nm, edges in graph.items():
+            for d in sorted(edges):
+                if scc_of[nm] == scc_of[d] and names[d] <= names[nm]:
+                    dropped.append((nm, d))
+        if dropped:
+            drop_set = set(dropped)
+            for nm in graph:
+                graph[nm] = {d for d in graph[nm] if (nm, d) not in drop_set}
+            self.warnings.append(
+                f"cycle prune: broke {len({scc_of[a] for a, _ in dropped})} SCC(s) "
+                f"by registration order, dropped {len(dropped)} name edges: "
+                + ", ".join(f"{a} <- {b}" for a, b in dropped)
+            )
+
+        # write back per-key dep lists
+        for key, m in self.modules.items():
+            nm = m["name"]
+            kept = []
+            for d in m["deps"]:
+                if "@" in d:
+                    kept.append(d)  # unresolvable at eval; inert
+                    continue
+                dn = name_of(d)
+                if dn != nm and dn in graph[nm]:
+                    kept.append(d)
+            m["deps"] = kept
 
     def run(self):
         self.process_file("", "Makefile")
@@ -713,6 +855,7 @@ class Mapper:
         self.resolve_sources()
         self.detect_extra_dirs()
         self.scan_exports_and_deps()
+        self.prune_cycles()
 
 
 def run_parallel(func, items, chunksize):

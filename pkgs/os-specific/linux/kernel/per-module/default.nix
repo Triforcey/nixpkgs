@@ -28,10 +28,6 @@
     "DEPMOD=true"
     "INSTALL_MOD_STRIP=1"
   ],
-  # Optional subset for incremental/smoke builds: only these modules get
-  # per-module drvs. The aggregate remains functionally complete - its
-  # resumed `make modules` compiles whatever stage-1 artifacts are missing.
-  onlyModules ? null,
   # Escape hatch: extra source dirs some modules need beyond their own
   # (mapper cannot see all header-dir relationships). attrset name -> [dir].
   extraSourceDirs ? { },
@@ -40,12 +36,13 @@
 let
   inherit (kernel) modDirVersion version;
 
+  # Full mode only: every =m module in the map gets its own compile drv.
+  # There is no subset mode - a subset saves nothing (the aggregate
+  # recompiles uncovered modules internally) and the subset manifest changes
+  # the aggregate's drv identity, fragmenting the one drv that matters for
+  # cache reuse. See NOTES.md.
   mapDrv = callPackage ./mapper.nix { inherit kernel; };
   moduleMap = builtins.fromJSON (builtins.readFile "${mapDrv}/modules.json");
-
-  selected =
-    if onlyModules == null then moduleMap.modules
-    else builtins.filter (m: lib.elem m.name onlyModules) moduleMap.modules;
 
   # Make flags for the compile-only module drvs. Same toolchain wiring as the
   # core build so recorded command lines stay comparable across the two
@@ -263,7 +260,7 @@ let
   # expects the same mapper to produce them; Nix dedups identical drvs.
   modules = lib.fix (
     self: builtins.listToAttrs (
-      map (m: lib.nameValuePair m.name (mkCompileModule self m)) selected
+      map (m: lib.nameValuePair m.name (mkCompileModule self m)) moduleMap.modules
     )
   );
 
@@ -337,7 +334,7 @@ let
   completeModule =
     name:
     let
-      info = builtins.head (builtins.filter (m: m.name == name) selected);
+      info = builtins.head (builtins.filter (m: m.name == name) moduleMap.modules);
     in
     callPackage ./complete-module.nix {
       inherit kernel core kernelModuleMakeFlags;
