@@ -222,6 +222,18 @@ real integration bugs, each fixed with a commit:
    fragmenting the one drv that matters for cache reuse. Full mode is the
    only mode; cheap smoke testing is done by building individual module
    drvs / the tier, not by a subset flag.
+12. **aarch64**: the image drv's installPhase hardcoded
+   `arch/x86/boot/bzImage`; parameterized to
+   `arch/${srcArch}/boot/${kernel.target}`, where srcArch maps the make
+   ARCH value (hostPlatform.linuxArch: "x86_64", "arm64") to the
+   build-tree directory form ("x86", "arm64") - the same SRCARCH subst
+   the kernel's top Makefile applies. On x86_64 the interpolated string
+   is byte-identical (drv identities unchanged); aarch64 builds
+   (e.g. the x1e80100 7.3 kernel) get `arch/arm64/boot/Image`.
+   insert-sys-cert is arch-independent (it writes the
+   `system_extra_cert` / `system_certificate_list_size` ELF symbols from
+   `certs/common.c`, built on every arch), and rebuild-image's only
+   x86-ism (`--assume-old=vmlinux.unstripped`) is already isx86-gated.
 
 ## Smoke chain verification (kernel 6.18.58, x86_64, nixbuild.net)
 

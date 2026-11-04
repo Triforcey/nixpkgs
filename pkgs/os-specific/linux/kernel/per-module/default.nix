@@ -36,6 +36,21 @@
 let
   inherit (kernel) modDirVersion version;
 
+  # The arch/ directory in the kernel build tree (the top Makefile's
+  # SRCARCH). Differs from the make ARCH value (kernelArch =
+  # hostPlatform.linuxArch, e.g. "x86_64") on x86: make ARCH=x86_64 builds
+  # into arch/x86/. aarch64's linuxArch ("arm64") is already the directory
+  # name. Same subst the kernel Makefile applies via
+  # `SRCARCH := $(subst x86_64,x86,$(SRCARCH))`.
+  srcArch =
+    {
+      x86_64 = "x86";
+      i386 = "x86";
+      i686 = "x86";
+    }
+    .${kernel.stdenv.hostPlatform.linuxArch}
+    or kernel.stdenv.hostPlatform.linuxArch;
+
   # Full mode only: every =m module in the map gets its own compile drv.
   # There is no subset mode - a subset saves nothing (the aggregate
   # recompiles uncovered modules internally) and the subset manifest changes
@@ -320,10 +335,15 @@ let
     # out output - a read-only store path in this drv's sandbox. Install
     # the rebuilt image directly (the make install target only copies
     # KBUILD_IMAGE and System.map to INSTALL_PATH).
+    # The built image lives at arch/<srcArch>/boot/<target> in the
+    # resumed build tree. On x86_64 the interpolated string is
+    # byte-identical to the previous hardcode (arch/x86/boot/bzImage), so
+    # x86 drv identities are unchanged; aarch64 builds (e.g. the x1e80100
+    # 7.3 kernel) get arch/arm64/boot/Image.
     installPhase = ''
       runHook preInstall
       mkdir -p $out
-      install -Dm644 arch/x86/boot/bzImage $out/${kernel.target}
+      install -Dm644 arch/${srcArch}/boot/${kernel.target} $out/${kernel.target}
       install -Dm644 System.map $out/System.map
       runHook postInstall
     '';
