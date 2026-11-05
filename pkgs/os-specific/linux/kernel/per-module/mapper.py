@@ -608,6 +608,47 @@ class Mapper:
                     self.warnings.append(f"{m['dir']}: no source found for object {obj}")
             m["sources"] = srcs
 
+    def fix_module_dirs(self):
+        """kbuild compiles obj-$(CONFIG_X) += subdir/file.o from the
+        Makefile that names the object; the file's own directory needs no
+        Makefile of its own (ti: 'icssg/icss_iep.o' with icssg/ holding
+        only sources). An M= build of such a subdir fails with
+        'Makefile: No such file or directory' - the per-module build must
+        target a directory kbuild can process, i.e. one whose Makefile
+        defines the module. Reassign the dir to the nearest ancestor
+        whose Makefile/Kbuild mentions one of the module's objects, and
+        prefix the dir-relative objects with the relative tail.
+        Sources are already tree-relative (resolve_sources) and stay
+        valid; the dir copy then carries the whole subtree (incl. the
+        sources' subdir) into modsrc."""
+        for m in self.modules.values():
+            base = m["dir"]
+            if (os.path.exists(os.path.join(self.srcdir, base, "Makefile"))
+                    or os.path.exists(os.path.join(self.srcdir, base, "Kbuild"))):
+                continue
+            objects = m.get("objects") or []
+            anc = os.path.dirname(base)
+            while anc and anc not in ("", ".", "/"):
+                hit = False
+                for mk in ("Makefile", "Kbuild"):
+                    try:
+                        with open(os.path.join(self.srcdir, anc, mk), errors="replace") as f:
+                            mktext = f.read()
+                    except OSError:
+                        continue
+                    if any(obj in mktext for obj in objects):
+                        hit = True
+                        break
+                if hit:
+                    tail = os.path.relpath(base, anc)
+                    m["dir"] = anc
+                    m["objects"] = [os.path.join(tail, o) for o in objects]
+                    break
+                anc = os.path.dirname(anc)
+            else:
+                self.warnings.append(
+                    f"{base}: no ancestor Makefile mentions {objects}; dir kept")
+
     def detect_extra_dirs(self):
         """Modules may include headers outside their own directory via
         relative paths (e.g. 8250.h including ../serial_mctrl_gpio.h). The
@@ -1000,6 +1041,7 @@ class Mapper:
         else:
             self.warnings.append("root: no Kbuild file")
         self.resolve_sources()
+        self.fix_module_dirs()
         self.detect_extra_dirs()
         self.scan_exports_and_deps()
         self.prune_cycles()
