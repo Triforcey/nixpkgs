@@ -1030,6 +1030,24 @@ class Mapper:
                     kept.append(d)
             m["deps"] = kept
 
+    def drop_build_tree_bound_modules(self):
+        """kheaders (IKHEADERS) embeds the kernel headers into
+        kheaders_data.tar.xz; kernel/Makefile's kheaders-objlist target
+        runs 'find include/generated ...' - a build-tree path that does
+        not resolve in an isolated M= sandbox (the single-target rule
+        runs it under the modsrc dir). No modsrc-only build can produce
+        correct data. Drop such modules from the tier; the final
+        aggregate's make builds missing artifacts naturally in the real
+        build tree (which has include/generated)."""
+        drop = {"kheaders"}
+        dropped = [k for k, m in self.modules.items()
+                   if m["name"] in drop or m["name"].split("@")[0] in drop]
+        for k in dropped:
+            del self.modules[k]
+        if dropped:
+            self.warnings.append(
+                f"dropped build-tree-bound modules: {sorted(dropped)}")
+
     def run(self):
         self.process_file("", "Makefile")
         if os.path.exists(os.path.join(self.srcdir, "Kbuild")):
@@ -1045,6 +1063,7 @@ class Mapper:
         self.detect_extra_dirs()
         self.scan_exports_and_deps()
         self.prune_cycles()
+        self.drop_build_tree_bound_modules()
 
 
 def run_parallel(func, items, chunksize):
