@@ -740,6 +740,36 @@ class Mapper:
                     except OSError:
                         continue
                     fdir = os.path.dirname(rel)
+                    # Tracepoint machinery: '#include TRACE_INCLUDE(...)'
+                    # is macro-expanded, so the include regex cannot see
+                    # it. When a reached header pulls in
+                    # trace/define_trace.h, resolve its
+                    # TRACE_INCLUDE_PATH/TRACE_INCLUDE_FILE and record the
+                    # dir that must be on the -I path. The real build gets
+                    # it there via the Makefile's -I flags, which are dead
+                    # here for srctree-based ones; the drvs' KCFLAGS -I
+                    # entries (one per extraDir) supply it instead. The
+                    # a/b KCFLAGS probe already covers PATHs that climb out
+                    # of include/trace into the module's own dir, so only
+                    # dirs that are not already reachable need recording
+                    # (hns3: TRACE_INCLUDE_PATH=. with the trace header in
+                    # the hns3pf/ subdir of the module dir).
+                    if "trace/define_trace.h" in text:
+                        pm = re.search(r'#define\s+TRACE_INCLUDE_PATH\s+([^\n]+)', text)
+                        fm = re.search(r'#define\s+TRACE_INCLUDE_FILE\s+([^\n]+)', text)
+                        if pm and fm:
+                            tpath = re.sub(r"/\\*.*", "", pm.group(1)).strip()
+                            tfname = re.sub(r"/\\*.*", "", fm.group(1)).strip() + ".h"
+                            for loc in (
+                                os.path.normpath(os.path.join(fdir, tpath, tfname)),
+                                os.path.normpath(os.path.join("include/trace", tpath, tfname)),
+                                os.path.normpath(os.path.join(base, tpath, tfname)),
+                            ):
+                                if os.path.exists(os.path.join(self.srcdir, loc)):
+                                    d = os.path.dirname(loc)
+                                    if d and d != base and d not in seen_dirs:
+                                        seen_dirs.add(d)
+                                    break
                     incs = [(mm.group(1), True)
                             for mm in inc_quoted_re.finditer(text)]
                     incs += [(mm.group(1), False)
