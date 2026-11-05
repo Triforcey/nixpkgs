@@ -184,9 +184,24 @@ let
         let
           copyExtra = lib.concatStringsSep "\n" (
             map (d: ''
-              mkdir -p "modsrc/${d}"
-              cp -a --reflink=auto "$coreSource/${d}/." "modsrc/${d}/"
-              chmod -R u+w "modsrc/${d}"
+              if [ -d "$coreSource/${d}" ]; then
+                mkdir -p "modsrc/${d}"
+                cp -a --reflink=auto "$coreSource/${d}/." "modsrc/${d}/"
+                chmod -R u+w "modsrc/${d}"
+              elif [ -d "$coreDev/lib/modules/${modDirVersion}/source/${d}" ]; then
+                # The retained dev source tree is the patched source with
+                # include/ and the kept headers - use it when the snapshot
+                # output predates a source-layout change (e.g. a snapshot
+                # taken before include/ was retained).
+                mkdir -p "modsrc/${d}"
+                cp -a --reflink=auto "$coreDev/lib/modules/${modDirVersion}/source/${d}/." "modsrc/${d}/"
+                chmod -R u+w "modsrc/${d}"
+              else
+                # Over-approximated include root that neither tree has:
+                # resolution falls back to srctree (angle includes resolve
+                # via kbuild's own -I paths).
+                echo "per-module: extraDir ${d} absent from core source and dev source; skipping" >&2
+              fi
             '') extraDirs
           );
           # The module's own Makefile flags like -I$(srctree)/x keep naming

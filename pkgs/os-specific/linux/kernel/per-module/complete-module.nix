@@ -89,9 +89,20 @@ stdenv.mkDerivation {
       esac
     done < "$compileDrv/manifest.txt"
     for d in $extraDirs; do
-      mkdir -p "modsrc/$d"
-      cp -a --reflink=auto "$coreSource/$d/." "modsrc/$d/"
-      chmod -R u+w "modsrc/$d"
+      if [ -d "$coreSource/$d" ]; then
+        mkdir -p "modsrc/$d"
+        cp -a --reflink=auto "$coreSource/$d/." "modsrc/$d/"
+        chmod -R u+w "modsrc/$d"
+      elif [ -d "$coreDev/lib/modules/${modDirVersion}/source/$d" ]; then
+        # The retained dev source tree is the patched source with include/
+        # and the kept headers - use it when the snapshot output predates a
+        # source-layout change.
+        mkdir -p "modsrc/$d"
+        cp -a --reflink=auto "$coreDev/lib/modules/${modDirVersion}/source/$d/." "modsrc/$d/"
+        chmod -R u+w "modsrc/$d"
+      else
+        echo "per-module: extraDir $d absent from core source and dev source; skipping" >&2
+      fi
     done
 
     # Bare-name quoted includes resolved via the module Makefile's
