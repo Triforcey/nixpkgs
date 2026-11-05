@@ -189,6 +189,14 @@ let
               chmod -R u+w "modsrc/${d}"
             '') extraDirs
           );
+          # The module's own Makefile flags like -I$(srctree)/x keep naming
+          # srctree (the pruned dev tree) during the M= build; the
+          # mapper-detected dirs are copied into modsrc, and these KCFLAGS
+          # -I entries make bare-name quoted includes resolve against the
+          # modsrc copies.
+          extraIncludeFlags = lib.concatMapStringsSep " " (
+            d: "-I$PWD/modsrc/${d}"
+          ) extraDirs;
         in
         ''
           runHook preBuild
@@ -220,7 +228,7 @@ let
           mkdir -p modsrc/a/b
           make -C "$coreBuild" -j"$NIX_BUILD_CORES" \
             ${quotedFlags} \
-            "KCFLAGS=-I$PWD/modsrc/a/b" \
+            "KCFLAGS=-I$PWD/modsrc/a/b ${extraIncludeFlags}" \
             "M=$PWD/modsrc/${m.dir}" \
             ${lib.escapeShellArg target}
 

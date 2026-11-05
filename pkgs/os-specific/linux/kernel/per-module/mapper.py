@@ -615,13 +615,39 @@ class Mapper:
         directory whose files must also be copied for the includes to
         resolve. Walk breadth-first from the module dir: files in a newly
         discovered dir may themselves escape (capped for safety).
-        Over-approximation is safe (extra copied sources)."""
+        Over-approximation is safe (extra copied sources).
+
+        Bare-name quoted includes (e.g. au8522_priv.h including
+        "tuner-i2c.h") are resolved by the kernel build via the module's
+        own Makefile flags (-I$(srctree)/...). In an M= build those flags
+        still name srctree paths, and the srctree is the pruned dev tree,
+        so the referenced directory must be copied into modsrc and made
+        reachable again (the drvs add KCFLAGS -I entries pointing at the
+        modsrc copies). Detect that class here: a quoted include that does
+        not resolve relative to the scanning dir is looked up by basename
+        inside the module Makefile's -I$(srctree) directories."""
         inc_re = re.compile(r'#\s*include\s+"([^"]+)"')
+        # Cross-tree include roots the module's own Makefile/Kbuild names.
+        # These are the only resolution candidates an M= build has for
+        # bare-name quoted includes beyond the module dir itself.
+        cc_re = re.compile(r'-I\$\(srctree\)/?([^\s\\]+)')
         max_depth = 4
         for m in self.modules.values():
             base = m["dir"]
             seen_dirs = {base}
             frontier = [base]
+            candidates = []
+            for mk in ("Makefile", "Kbuild"):
+                try:
+                    with open(os.path.join(self.srcdir, base, mk), errors="replace") as f:
+                        mktext = f.read()
+                except OSError:
+                    continue
+                for mm in cc_re.finditer(mktext):
+                    cdir = os.path.normpath(mm.group(1).rstrip("/\\"))
+                    if (cdir and cdir not in candidates
+                            and os.path.isdir(os.path.join(self.srcdir, cdir))):
+                        candidates.append(cdir)
             for _ in range(max_depth):
                 nxt = []
                 for d in frontier:
@@ -644,18 +670,29 @@ class Mapper:
                             if inc.startswith("/"):
                                 continue
                             target = os.path.normpath(os.path.join(d, inc))
-                            if target == base or target.startswith(base + os.sep):
-                                continue
+                            if os.path.exists(os.path.join(self.srcdir, target)):
+                                if target == base or target.startswith(base + os.sep):
+                                    continue
+                                td = os.path.dirname(target)
+                            elif "/" not in inc:
+                                # Bare name: resolved via the module
+                                # Makefile's -I$(srctree) include roots.
+                                td = next(
+                                    (cd for cd in candidates
+                                     if os.path.exists(
+                                         os.path.join(self.srcdir, cd, inc))),
+                                    None,
+                                )
+                            else:
+                                td = None
                             # Only copy directories for includes that resolve
                             # to an existing file in the source tree; quoted
                             # includes that exist nowhere (generated headers,
                             # asm/... resolved via -I) need no copy.
-                            if not os.path.exists(os.path.join(self.srcdir, target)):
+                            if not td or td in seen_dirs:
                                 continue
-                            td = os.path.dirname(target)
-                            if td and td not in seen_dirs:
-                                seen_dirs.add(td)
-                                nxt.append(td)
+                            seen_dirs.add(td)
+                            nxt.append(td)
                 if not nxt:
                     break
                 frontier = nxt

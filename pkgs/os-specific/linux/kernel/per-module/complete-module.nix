@@ -94,6 +94,14 @@ stdenv.mkDerivation {
       chmod -R u+w "modsrc/$d"
     done
 
+    # Bare-name quoted includes resolved via the module Makefile's
+    # -I$(srctree)/x flags: srctree is the pruned dev tree, so point gcc
+    # at the modsrc copies of the mapper-detected dirs instead.
+    extraIncFlags=""
+    for d in $extraDirs; do
+      extraIncFlags="$extraIncFlags -I$PWD/modsrc/$d"
+    done
+
     mkdir -p modsrc/a/b
 
     # KBUILD_EXTRA_SYMBOLS: run the core's modpost over the dependency
@@ -140,7 +148,7 @@ stdenv.mkDerivation {
     make -C "$buildTree" -j"$NIX_BUILD_CORES" \
       ${quotedFlags} \
       "O=$buildTree" \
-      "KCFLAGS=-I$PWD/modsrc/a/b" \
+      "KCFLAGS=-I$PWD/modsrc/a/b ''${extraIncFlags}" \
       "KBUILD_MODPOST_WARN=1" \
       "M=$PWD/modsrc/${info.dir}" \
       "''${extraArgs[@]}" \
