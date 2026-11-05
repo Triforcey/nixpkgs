@@ -564,7 +564,17 @@ class Mapper:
                 else:
                     d.env[lhsx] = joined
                 if suffix not in ("", "n") and objs:
-                    d.obj_lists.setdefault(stem, []).extend(objs)
+                    # Assignment semantics mirror d.env above: `+=` appends,
+                    # `:=`/`=` replaces. A config-expanded composite line
+                    # (e.g. proc-$(CONFIG_MMU) := task_mmu.o with CONFIG_MMU=y
+                    # expanding to `proc-y := task_mmu.o`) must REPLACE the
+                    # composite's base list (proc-y := nommu.o task_nommu.o) -
+                    # blind extension collected the no-MMU branch's objects
+                    # (nommu.o) into MMU kernels and broke the fs/proc unit.
+                    if "+" in op:
+                        d.obj_lists.setdefault(stem, []).extend(objs)
+                    else:
+                        d.obj_lists[stem] = list(objs)
                 continue
 
             # any other var: record raw value (core-y, drivers-y, libs-y, ...)
