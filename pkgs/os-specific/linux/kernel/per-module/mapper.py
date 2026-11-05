@@ -799,8 +799,8 @@ class Mapper:
                         pm = re.search(r'#define\s+TRACE_INCLUDE_PATH\s+([^\n]+)', text)
                         fm = re.search(r'#define\s+TRACE_INCLUDE_FILE\s+([^\n]+)', text)
                         if pm and fm:
-                            tpath = re.sub(r"/\\*.*", "", pm.group(1)).strip()
-                            tfname = re.sub(r"/\\*.*", "", fm.group(1)).strip() + ".h"
+                            tpath = re.sub(r"/\*.*", "", pm.group(1)).strip()
+                            tfname = re.sub(r"/\*.*", "", fm.group(1)).strip() + ".h"
                             for loc in (
                                 os.path.normpath(os.path.join(fdir, tpath, tfname)),
                                 os.path.normpath(os.path.join("include/trace", tpath, tfname)),
@@ -810,6 +810,22 @@ class Mapper:
                                     d = os.path.dirname(loc)
                                     if d and d != base and d not in seen_dirs:
                                         seen_dirs.add(d)
+                                    elif d == base:
+                                        # The trace header lives in the module
+                                        # dir itself. In-tree the define_trace
+                                        # re-include resolves via -I$(src)
+                                        # (ccflags-y or a per-file
+                                        # CFLAGS_<f>.o flag, e.g. mac802154's
+                                        # CFLAGS_trace.o := -I$(src)). The
+                                        # sandbox has no automatic own-dir -I,
+                                        # and a KCFLAGS extraDir may contain a
+                                        # same-named trace header of a sibling
+                                        # module (mac802154 vs
+                                        # net/ieee802154) shadowing the
+                                        # module's own system. The drv places
+                                        # -I$PWD/modsrc/<dir> FIRST when this
+                                        # flag is set.
+                                        m["ownDirIncludeFirst"] = True
                                     break
                     incs = [(mm.group(1), True)
                             for mm in inc_quoted_re.finditer(text)]

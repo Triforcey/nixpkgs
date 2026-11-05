@@ -253,7 +253,13 @@ let
           mkdir -p modsrc/a/b
           make -C "$coreBuild" -j"$NIX_BUILD_CORES" \
             ${quotedFlags} \
-            "KCFLAGS=-I$PWD/modsrc/a/b ${extraIncludeFlags}" \
+            # ownDirIncludeFirst: the module's trace header lives in the
+            # module dir itself; in-tree the define_trace re-include
+            # resolves via -I$(src) (per-file CFLAGS_<f>.o, e.g.
+            # mac802154's CFLAGS_trace.o). The own-dir -I must precede the
+            # extraDir entries so a sibling module's same-named trace
+            # header cannot shadow the module's own system.
+            "KCFLAGS=${lib.optionalString (m.ownDirIncludeFirst or false) "-I$PWD/modsrc/${m.dir} "}-I$PWD/modsrc/a/b ${extraIncludeFlags}" \
             "M=$PWD/modsrc/${m.dir}" \
             ${lib.escapeShellArg target}
 
