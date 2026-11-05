@@ -633,7 +633,17 @@ class Mapper:
 
         Both quoted ("...") and angle (<...>) includes are scanned; angle
         includes never resolve relative to the including file's directory,
-        only through srctree roots."""
+        only through srctree roots.
+
+        Ancestor Makefiles: subdir-ccflags-y propagates to every descendant
+        directory in the real build (gpib: drivers/gpib/Makefile sets
+        subdir-ccflags-y += -I$(src)/include, which is how gpibP.h in
+        drivers/gpib/include/ is found), but an M= build of the module dir
+        never reads ancestors, so those flags are lost. Collect their
+        include roots here: $(src)-relative roots resolve relative to the
+        ANCESTOR dir and are copied into modsrc at the in-tree path (the
+        drvs' KCFLAGS -I entries make them reachable); $(srctree) roots
+        join the candidate pool like the module's own."""
         inc_quoted_re = re.compile(r'#\s*include\s+"([^"]+)"')
         inc_angle_re = re.compile(r'#\s*include\s+<([^>]+)>')
         # -I flags, tolerating space between -I and the argument (kernel
@@ -667,6 +677,40 @@ class Mapper:
                         if (cdir and cdir not in candidates
                                 and os.path.isdir(os.path.join(self.srcdir, cdir))):
                             candidates.append(cdir)
+
+            # subdir-ccflags-y in ancestor Makefiles (kbuild propagates it
+            # to all descendants; M= builds of the module dir never read
+            # ancestors, so the roots must be recovered here).
+            anc = os.path.dirname(base)
+            while anc and anc not in ("", ".", "/"):
+                for mk in ("Makefile", "Kbuild"):
+                    try:
+                        with open(os.path.join(self.srcdir, anc, mk), errors="replace") as f:
+                            mktext = f.read()
+                    except OSError:
+                        continue
+                    for ln in mktext.splitlines():
+                        if "subdir-ccflags-y" not in ln:
+                            continue
+                        for mm in flag_re.finditer(ln):
+                            kind, rest = mm.group(1), mm.group(2)
+                            if kind == "src":
+                                rdir = os.path.normpath(
+                                    os.path.join(anc, rest) if rest else anc)
+                                if (rdir != base and rdir not in seen_dirs
+                                        and os.path.isdir(
+                                            os.path.join(self.srcdir, rdir))):
+                                    seen_dirs.add(rdir)
+                            else:
+                                cdir = os.path.normpath(rest.rstrip("/\\"))
+                                if (cdir and cdir not in candidates
+                                        and os.path.isdir(
+                                            os.path.join(self.srcdir, cdir))):
+                                    candidates.append(cdir)
+                parent = os.path.dirname(anc)
+                if parent == anc:
+                    break
+                anc = parent
             # Newly added $(src) roots participate in the BFS: their files
             # may include further headers relative to themselves.
             frontier = sorted(seen_dirs)
