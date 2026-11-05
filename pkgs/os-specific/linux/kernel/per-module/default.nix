@@ -85,7 +85,15 @@ let
       # steps are up to date here, so this only generates the lds.
       make "''${makeFlags[@]}" modules_prepare
     '';
-    installTargets = [ (kernel.installTargetFor kernel.target) ];
+    # Stock build.nix appends `modules_install` (dropped here: the
+    # aggregate replaces it) AND `dtbs_install` when buildDTBs — the latter
+    # drop was accidental. aarch64 consumers reach the dtbs through
+    # hardware.deviceTree.dtbSource = ${kernelPackage}/dtbs, and
+    # INSTALL_DTBS_PATH already targets $out/dtbs, so restore it. On x86
+    # (buildDTBs = false) the list stays identical to the old one.
+    installTargets =
+      [ (kernel.installTargetFor kernel.target) ]
+      ++ lib.optionals kernel.buildDTBs [ "dtbs_install" ];
     preInstall = (old.preInstall or "") + ''
       # Stash files that this kernel's `make clean` (run by postInstall)
       # removes but downstream modpost/modfinal need:

@@ -234,6 +234,36 @@ real integration bugs, each fixed with a commit:
    `system_extra_cert` / `system_certificate_list_size` ELF symbols from
    `certs/common.c`, built on every arch), and rebuild-image's only
    x86-ism (`--assume-old=vmlinux.unstripped`) is already isx86-gated.
+13. **aarch64 consumer surface of the assembled kernel** (fertile-forge
+   build failure): NixOS out-of-tree builders and the deviceTree module
+   consume attrs off `config.boot.kernelPackages.kernel` that the glue's
+   assembled runCommand must forward explicitly:
+   - `msm-kernel-module` does `inherit (kernel) src version postPatch
+     nativeBuildInputs` — mkDerivation exposes raw drv-arg attrs on the
+     stock kernel drv; runCommand does not. The glue forwards
+     `postPatch`/`nativeBuildInputs` through its passthru (version/src
+     were already covered by the baseKernel.passthru spread).
+   - `hardware.deviceTree.dtbSource` defaults to
+     `${kernelPackage}/dtbs` with kernelPackage = the assembled kernel;
+     the stock kernel satisfies it via `dtbs_install` into `$out/dtbs`.
+     The core's `installTargets` had dropped `dtbs_install` along with
+     the intentional `modules_install` drop — restored under
+     `lib.optionals kernel.buildDTBs` (x86: buildDTBs false → identical
+     installTargets → byte-identical core identity), and the assembled
+     drv symlinks the core's dtbs output into `$out/dtbs`.
+   - The dtbo overlay include path
+     (`${getDev kernelPackage}/lib/modules/<ver>/source/scripts/dtc/include-prefixes`)
+     resolves against the core's dev tree — verified present in the
+     built 6.18.59 core dev output.
+   - `system.modulesTree` uses `(lib.getOutput "modules" kernel)`, which
+     falls back to `kernel` itself when the drv has no `modules` output
+     — the assembled runCommand needs no `modules` output.
+   - The stock kernel's `vmlinux` (msm copies `$kernel_dev/vmlinux`) and
+     `Module.symvers` are present at the core dev root / build tree —
+     verified in the built core.
+   - `config.system.boot.loader.kernelFile` ("Image") equals
+     `kernel.target` on arm64, so the assembled `$out/${target}` symlink
+     satisfies the system-builder kernel image check.
 
 ## Smoke chain verification (kernel 6.18.58, x86_64, nixbuild.net)
 
