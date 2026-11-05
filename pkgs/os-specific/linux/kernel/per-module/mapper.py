@@ -473,17 +473,45 @@ class Mapper:
                 lhsx = expand(lhs, ctx).strip()
                 rhsx = expand(rhs, ctx)
             except Unresolved:
-                # Conservative: obj lines with unresolvable LHS still count
-                # toward obj-y/obj-m with the resolvable tokens.
+                # The LHS may still resolve on its own even when the RHS does
+                # not (e.g. obj-$(CONFIG_X) with X absent from .config ->
+                # "obj-", RHS referencing an undefined helper variable like
+                # pxa2xx-obj-y). The suffix alone decides: obj-y/obj-m are
+                # live targets; anything else ("n", "", arbitrary names) is
+                # config-gated off in real Kbuild, so dropping the whole line
+                # is exact, not an approximation. Blind y+m union here put
+                # arch-gated objects (pxa2xx_base.o, cpci_hotplug_core.o)
+                # into builtin units and broke their compiles.
                 if re.match(r"^obj-", lhs.strip()):
+                    try:
+                        lhs_only = expand(lhs, Ctx(self.cfg, d.env, self.unset, self.warnings, where, self.absent)).strip()
+                    except Unresolved:
+                        lhs_only = None
+                    suffix = lhs_only[4:] if lhs_only is not None else None
+                    if suffix is not None and not (
+                        suffix == "y" or suffix == "m"
+                        or (suffix and set(suffix) <= set("ym"))
+                    ):
+                        continue
+                    # Live or genuinely unresolvable LHS: conservative
+                    # inclusion of the resolvable tokens, routed to the LHS's
+                    # own list when the suffix is known (obj-y wins over m in
+                    # real Kbuild, so y-only routing for a resolved y LHS is
+                    # exact; the y+m union remains only for a dead LHS).
+                    if suffix == "m":
+                        lists = [d.obj_m]
+                    elif suffix == "y":
+                        lists = [d.obj_y]
+                    else:
+                        lists = [d.obj_y, d.obj_m]
+                        self.warnings.append(f"{where}: unresolvable obj assignment '{lhs}' (treating as y and m)")
                     for tok in rhs.split():
                         try:
                             tx = expand(tok, Ctx(self.cfg, d.env, self.unset, self.warnings, where, self.absent))
                         except Unresolved:
                             continue
-                        d.obj_y.append(tx)
-                        d.obj_m.append(tx)
-                    self.warnings.append(f"{where}: unresolvable obj assignment '{lhs}' (treating as y and m)")
+                        for tgt in lists:
+                            tgt.append(tx)
                 continue
             if "$(" in lhsx or "$(" in rhsx:
                 self.warnings.append(f"{where}: partially expanded assignment '{lhs} {op} {rhs}'")
