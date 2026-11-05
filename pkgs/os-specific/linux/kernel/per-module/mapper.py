@@ -274,7 +274,7 @@ class Dir:
         self.env = {}
         self.obj_y = []
         self.obj_m = []
-        self.obj_lists = {}  # stem -> [objects] from foo-y / foo-objs / foo-m
+        self.obj_lists = {}  # stem -> {"y": [...], "m": [...]} from foo-y/foo-objs/foo-m
         self.frames = []
 
     def collect(self):
@@ -565,16 +565,21 @@ class Mapper:
                     d.env[lhsx] = joined
                 if suffix not in ("", "n") and objs:
                     # Assignment semantics mirror d.env above: `+=` appends,
-                    # `:=`/`=` replaces. A config-expanded composite line
-                    # (e.g. proc-$(CONFIG_MMU) := task_mmu.o with CONFIG_MMU=y
-                    # expanding to `proc-y := task_mmu.o`) must REPLACE the
-                    # composite's base list (proc-y := nommu.o task_nommu.o) -
-                    # blind extension collected the no-MMU branch's objects
-                    # (nommu.o) into MMU kernels and broke the fs/proc unit.
+                    # `:=`/`=` replaces - per SUFFIX bucket, because foo-y and
+                    # foo-m are separate make variables. Provenance matters:
+                    # real kbuild's real-obj-y consumes only -objs/-y parts
+                    # of a built-in composite, while -m parts are consumed
+                    # only when the composite itself is a module. mounts-m +=
+                    # do_mounts_rd.o (CONFIG_BLK_DEV_RAM=m) is dead for the
+                    # built-in mounts.o - flattening it into the builtin@init
+                    # unit compiled do_mounts_rd.c against do_mounts.h's
+                    # no-op stubs and broke the init unit.
+                    bucket = "m" if suffix == "m" else "y"
                     if "+" in op:
-                        d.obj_lists.setdefault(stem, []).extend(objs)
+                        d.obj_lists.setdefault(stem, {}).setdefault(bucket, []).extend(objs)
                     else:
-                        d.obj_lists[stem] = list(objs)
+                        prev = d.obj_lists.get(stem) or {}
+                        d.obj_lists[stem] = {**prev, bucket: list(objs)}
                 continue
 
             # any other var: record raw value (core-y, drivers-y, libs-y, ...)
@@ -616,8 +621,9 @@ class Mapper:
                 continue
             stem = tok[:-2] if tok.endswith(".o") else tok
             self._mark_builtin(os.path.normpath(os.path.join(real, stem)))
-            # composite object parts inherit the composite's y/m status
-            for part in d.obj_lists.get(stem, []):
+            # composite object parts inherit the composite's y/m status;
+            # only -objs/-y parts are part-of-builtin (real-obj-y)
+            for part in (d.obj_lists.get(stem) or {}).get("y", []):
                 if part.endswith("/"):
                     continue
                 pstem = part[:-2] if part.endswith(".o") else part
@@ -667,10 +673,13 @@ class Mapper:
             if tok.endswith("/"):
                 continue
             stem = tok[:-2] if tok.endswith(".o") else tok
-            lst = d.obj_lists.get(stem)
-            if lst:
-                objs.extend(o for o in lst if not o.endswith("/"))
+            parts = [o for o in (d.obj_lists.get(stem) or {}).get("y", [])
+                     if not o.endswith("/")]
+            if parts:
+                objs.extend(parts)
             else:
+                # no -y/-objs parts: real kbuild treats the target as a
+                # plain single object (real-obj-y falls back to $(m))
                 objs.append(tok if tok.endswith(".o") else stem + ".o")
         if not objs:
             return
@@ -693,7 +702,9 @@ class Mapper:
 
     def register_module(self, stem, d, real):
         objects = []
-        lst = d.obj_lists.get(stem)
+        buckets = d.obj_lists.get(stem) or {}
+        # real-obj-m consumes -objs/-y AND -m parts of a module composite
+        lst = buckets.get("y", []) + buckets.get("m", [])
         if lst:
             for o in lst:
                 if o.endswith(".o"):
