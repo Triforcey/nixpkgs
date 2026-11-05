@@ -617,20 +617,28 @@ class Mapper:
         discovered dir may themselves escape (capped for safety).
         Over-approximation is safe (extra copied sources).
 
-        Bare-name quoted includes (e.g. au8522_priv.h including
-        "tuner-i2c.h") are resolved by the kernel build via the module's
-        own Makefile flags (-I$(srctree)/...). In an M= build those flags
-        still name srctree paths, and the srctree is the pruned dev tree,
-        so the referenced directory must be copied into modsrc and made
-        reachable again (the drvs add KCFLAGS -I entries pointing at the
-        modsrc copies). Detect that class here: a quoted include that does
-        not resolve relative to the scanning dir is looked up by basename
-        inside the module Makefile's -I$(srctree) directories."""
-        inc_re = re.compile(r'#\s*include\s+"([^"]+)"')
-        # Cross-tree include roots the module's own Makefile/Kbuild names.
-        # These are the only resolution candidates an M= build has for
-        # bare-name quoted includes beyond the module dir itself.
-        cc_re = re.compile(r'-I\$\(srctree\)/?([^\s\\]+)')
+        Include-root flags in the module's own Makefile/Kbuild name the
+        other resolution roots an M= build has:
+
+        - `-I $(src)/x`: $(src) is the module dir in an M= build, so these
+          resolve inside modsrc once the named dir is copied there at its
+          in-tree path (brcmfmac/bca: `-I $(src)/..` for core.h, bus.h).
+          Added unconditionally - the real kernel build always compiles
+          with these roots.
+        - `-I$(srctree)/x`: still names srctree, which is the pruned dev
+          tree, so the dir must be copied into modsrc AND made reachable
+          (the drvs add KCFLAGS -I entries pointing at the modsrc copies).
+          Added when a scanned include actually resolves inside such a
+          root (au8522_priv.h "tuner-i2c.h" -> drivers/media/tuners).
+
+        Both quoted ("...") and angle (<...>) includes are scanned; angle
+        includes never resolve relative to the including file's directory,
+        only through srctree roots."""
+        inc_quoted_re = re.compile(r'#\s*include\s+"([^"]+)"')
+        inc_angle_re = re.compile(r'#\s*include\s+<([^>]+)>')
+        # -I flags, tolerating space between -I and the argument (kernel
+        # Makefiles write both "-I$(src)/.." and "-I $(src)").
+        flag_re = re.compile(r'-I\s*\$\((src|srctree)\)/?([^\s\\]*)')
         max_depth = 4
         for m in self.modules.values():
             base = m["dir"]
@@ -643,11 +651,25 @@ class Mapper:
                         mktext = f.read()
                 except OSError:
                     continue
-                for mm in cc_re.finditer(mktext):
-                    cdir = os.path.normpath(mm.group(1).rstrip("/\\"))
-                    if (cdir and cdir not in candidates
-                            and os.path.isdir(os.path.join(self.srcdir, cdir))):
-                        candidates.append(cdir)
+                for mm in flag_re.finditer(mktext):
+                    kind, rest = mm.group(1), mm.group(2)
+                    if kind == "src":
+                        # $(src) is the module dir in an M= build: the flag
+                        # resolves inside modsrc once the named dir exists.
+                        if not rest:
+                            continue
+                        rdir = os.path.normpath(os.path.join(base, rest))
+                        if (rdir != base
+                                and os.path.isdir(os.path.join(self.srcdir, rdir))):
+                            seen_dirs.add(rdir)
+                    else:
+                        cdir = os.path.normpath(rest.rstrip("/\\"))
+                        if (cdir and cdir not in candidates
+                                and os.path.isdir(os.path.join(self.srcdir, cdir))):
+                            candidates.append(cdir)
+            # Newly added $(src) roots participate in the BFS: their files
+            # may include further headers relative to themselves.
+            frontier = sorted(seen_dirs)
             for _ in range(max_depth):
                 nxt = []
                 for d in frontier:
@@ -665,8 +687,11 @@ class Mapper:
                                 text = f.read()
                         except OSError:
                             continue
-                        for mm in inc_re.finditer(text):
-                            inc = mm.group(1)
+                        incs = [(mm.group(1), True)
+                                for mm in inc_quoted_re.finditer(text)]
+                        incs += [(mm.group(1), False)
+                                 for mm in inc_angle_re.finditer(text)]
+                        for inc, quoted in incs:
                             if inc.startswith("/"):
                                 continue
                             target = os.path.normpath(os.path.join(d, inc))
@@ -674,9 +699,10 @@ class Mapper:
                                 if target == base or target.startswith(base + os.sep):
                                     continue
                                 td = os.path.dirname(target)
-                            elif "/" not in inc:
-                                # Bare name: resolved via the module
-                                # Makefile's -I$(srctree) include roots.
+                            elif not quoted or "/" not in inc:
+                                # Unresolved bare-name or angle include:
+                                # resolved via the module Makefile's
+                                # -I$(srctree) include roots.
                                 td = next(
                                     (cd for cd in candidates
                                      if os.path.exists(
