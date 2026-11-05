@@ -154,7 +154,17 @@ let
         (m.extraDirs or [ ]) ++ extraSourceDirs.${m.name} or [ ]
       );
       quotedFlags = lib.concatMapStringsSep " " lib.escapeShellArg moduleMakeFlags;
-      target = "${m.name}.o";
+      # make target for the stage-1 object build. For composite modules
+      # (and single objects named <name>.o at the dir root) the kbuild
+      # module-name target <name>.o works. For single-object modules whose
+      # object carries a subdir prefix (ti: obj-... += icssg/icss_iep.o;
+      # efi: stmm/tee_stmm_efi.o) the bare <name>.o goal has no rule (the
+      # pattern rule's stem resolves against the dir root, where no .c
+      # exists); the goal must carry the object path so the %.o pattern
+      # rule resolves to the real source.
+      target = if builtins.length m.objects == 1
+        then builtins.head m.objects
+        else "${m.name}.o";
     in
     stdenv.mkDerivation {
       pname = "linux-module-${m.name}";
