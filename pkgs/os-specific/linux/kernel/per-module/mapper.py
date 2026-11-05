@@ -649,7 +649,7 @@ class Mapper:
         # -I flags, tolerating space between -I and the argument (kernel
         # Makefiles write both "-I$(src)/.." and "-I $(src)").
         flag_re = re.compile(r'-I\s*\$\((src|srctree)\)/?([^\s\\]*)')
-        max_depth = 4
+        max_depth = 8
         for m in self.modules.values():
             base = m["dir"]
             seen_dirs = {base}
@@ -711,62 +711,72 @@ class Mapper:
                 if parent == anc:
                     break
                 anc = parent
-            # Newly added $(src) roots participate in the BFS: their files
-            # may include further headers relative to themselves.
-            frontier = sorted(seen_dirs)
+            # Include closure over FILES, seeded with the module's own
+            # sources. Multi-directory modules keep their sources in
+            # subdirs of the module dir (hns3: objects hns3pf/*.o under
+            # dir hns3), so a top-level dir scan misses them - and a
+            # subtree walk over-collects (shared dirs like dvb-frontends
+            # would re-scan every sibling module's files per module).
+            # A file-level BFS follows the actual include graph:
+            # quoted includes resolving inside the module dir enqueue the
+            # reached header (its own includes matter; no copy needed -
+            # the whole subtree ships in modsrc anyway), includes
+            # resolving outside the module dir record their dir for
+            # copying, and unresolved bare/angle includes resolve through
+            # the -I candidate roots collected above (the drvs make those
+            # roots reachable via KCFLAGS -I entries). All paths stay
+            # tree-relative.
+            scanned_files = set()
+            file_frontier = [s for s in (m.get("sources") or [])]
             for _ in range(max_depth):
-                nxt = []
-                for d in frontier:
-                    dpath = os.path.join(self.srcdir, d)
+                files_nxt = []
+                for rel in file_frontier:
+                    if rel in scanned_files:
+                        continue
+                    scanned_files.add(rel)
                     try:
-                        names = os.listdir(dpath)
+                        with open(os.path.join(self.srcdir, rel), errors="replace") as f:
+                            text = f.read()
                     except OSError:
                         continue
-                    for fn in names:
-                        if not fn.endswith((".c", ".h", ".S", ".rs", ".i", ".s")):
+                    fdir = os.path.dirname(rel)
+                    incs = [(mm.group(1), True)
+                            for mm in inc_quoted_re.finditer(text)]
+                    incs += [(mm.group(1), False)
+                             for mm in inc_angle_re.finditer(text)]
+                    for inc, quoted in incs:
+                        if inc.startswith("/"):
                             continue
-                        rel = os.path.normpath(os.path.join(d, fn))
-                        try:
-                            with open(os.path.join(self.srcdir, rel), errors="replace") as f:
-                                text = f.read()
-                        except OSError:
-                            continue
-                        incs = [(mm.group(1), True)
-                                for mm in inc_quoted_re.finditer(text)]
-                        incs += [(mm.group(1), False)
-                                 for mm in inc_angle_re.finditer(text)]
-                        for inc, quoted in incs:
-                            if inc.startswith("/"):
-                                continue
-                            target = os.path.normpath(os.path.join(d, inc))
-                            if os.path.exists(os.path.join(self.srcdir, target)):
-                                if target == base or target.startswith(base + os.sep):
-                                    continue
+                        target = os.path.normpath(os.path.join(fdir, inc))
+                        if os.path.exists(os.path.join(self.srcdir, target)):
+                            if (target != base
+                                    and not target.startswith(base + os.sep)):
                                 td = os.path.dirname(target)
-                            elif not quoted or "/" not in inc:
-                                # Unresolved bare-name or angle include:
-                                # resolved via the module Makefile's
-                                # -I$(srctree) include roots.
-                                td = next(
-                                    (cd for cd in candidates
-                                     if os.path.exists(
-                                         os.path.join(self.srcdir, cd, inc))),
-                                    None,
-                                )
-                            else:
-                                td = None
-                            # Only copy directories for includes that resolve
-                            # to an existing file in the source tree; quoted
-                            # includes that exist nowhere (generated headers,
-                            # asm/... resolved via -I) need no copy.
-                            if not td or td in seen_dirs:
-                                continue
-                            seen_dirs.add(td)
-                            nxt.append(td)
-                if not nxt:
+                                if td and td not in seen_dirs:
+                                    seen_dirs.add(td)
+                            # enqueue the reached header so its own
+                            # includes are followed as well
+                            files_nxt.append(target)
+                        elif not quoted or "/" not in inc:
+                            # Unresolved bare-name or angle include:
+                            # resolved via the collected -I$(srctree)
+                            # include roots.
+                            cd = next(
+                                (c for c in candidates
+                                 if os.path.exists(
+                                     os.path.join(self.srcdir, c, inc))),
+                                None,
+                            )
+                            if cd:
+                                if cd not in seen_dirs:
+                                    seen_dirs.add(cd)
+                                files_nxt.append(os.path.normpath(
+                                    os.path.join(cd, inc)))
+                file_frontier = files_nxt
+                if not file_frontier:
                     break
-                frontier = nxt
             m["extraDirs"] = sorted(seen_dirs - {base})
+
 
     def scan_exports_and_deps(self):
         mod_files = [(m["key"], [os.path.join(self.srcdir, s) for s in m["sources"]]) for m in self.modules.values()]
