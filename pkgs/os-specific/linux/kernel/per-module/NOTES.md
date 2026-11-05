@@ -322,12 +322,141 @@ modules - making a partial cache state a true incremental build.
   pure-Nix eval, then IFD'd. Rationale: ~8000 modules over thousands of
   Makefiles; 2.6 s in Python vs minutes of Nix eval. The *edges still come
   from the source at mapping time*; only the execution vehicle differs.
-- The compile-only drv needs a `src` output on the core drv (full patched
-  source) so module sources are patch-consistent with the core by
-  construction and module drvs never re-apply kernel patches. Cost: one
-  ~1.4 GB store path per kernel, shared by all module drvs.
+- The compile-only drvs no longer consume the core drv's patched source
+  output. Option A (below) replaced that design: module drvs seed the
+  unpatched upstream source and apply their own applicable patch subset,
+  so patch edits do not re-hash the whole tier.
+
+## Option A: patch localization (kernel 7.3 / aarch64 round) — SUPERSEDED by v2 below
+
+The original Option A kept a "structural core": the stock kernel
+re-derived with the structural patch subset and a FULL build (vmlinux,
+built-ins, dev tree). The operator's absolute rule — no full tree build,
+ever — makes that design void. What survives of Option A is the per-unit
+patch-set computation; what changed is everything about where those
+patches get applied and who compiles what.
+
+Before A, host patches were baked into the core drv's patched source and
+every module drv depended on that output, so ANY patch edit re-hashed all
+~7941 module drvs plus core plus aggregate. The mapper now classifies
+each host patch and computes per-module applicability:
+
+- **structural** — feeds the core build: touches anything outside =m
+  module dirs (include/, scripts/, devicetree bindings, defconfig), a
+  build file anywhere, or the source of a built-in (obj-y) object inside
+  a module dir. The glue re-derives the core from the stock
+  kernelPackages with ONLY structural host patches (randstructSeed and
+  features threaded through to match the glue's baseKernel; the stock
+  kernel's own patches re-apply via the override merge and are excluded
+  from the structural list to avoid double application).
+- **leaf** — touches only =m module-dir sources. Applied inside each
+  affected module's compile drv against the UNPATCHED upstream source
+  (a cheap `unpackedSource` drv whose identity is the source tarball
+  only). A leaf patch edit now re-hashes core not at all and only the
+  modules whose dir/closure the patch touches.
+
+Applicability is file/dir based: a module gets a patch when a touched
+path is one of its sources, sits in its transitive include closure, lies
+under its dir, or lies in one of its extraDirs. Creator dependencies
+(patch B modifies a file patch A creates) are resolved into the same set
+transitively, in patch-list order. Patches are staged into the sandbox
+by the buildPhase (raw path interpolation registers them as inputs;
+they must NOT go into nativeBuildInputs — stdenv sources single-file
+inputs as setup hooks, executing the patch text). Hunks targeting paths
+outside modsrc (include/, scripts/) fail harmlessly: those changes reach
+the module through the core dev tree, which carries the structural
+patches. The authoritative Module.symvers stays the aggregate's global
+modpost.
+
+The aggregate still derives from the fully patched kernel (its own
+sandbox applies all patches), so leftover compiles of patched-in modules
+are unchanged. Patch files are copied into `patches/` and applied with
+`patch --forward -p1 -d modsrc`; the staged filenames and the manifest
+are 1-based and must stay in sync (concatImapStrings is 1-based — this
+bit us once).
+
+Classification for the x1e80100 7.3 patchset: 10 classified patches, 2
+structural (rpmh devicetree binding = outside module dirs; rpmh
+regulator driver = built-in object source), 8 leaf, 434 modules carry a
+non-empty set (the shared-dir rule over-approximates: every module in
+drivers/regulator gets the rpmh patch — safe, just coarser).
 
 ## Known limitations
+
+## Patch localization v2: zero full-tree-build architecture (2026-11-05)
+
+Operator's absolute rule: **no full tree build, ever.** Everything that
+compiles happens in per-unit derivations; the final drv only links.
+
+Flow (as agreed):
+1. a source-only drv (`linux-<ver>-patched-source`) applies the stock
+   kernel's own patches plus EVERY host patch; the mapper walks THAT tree,
+   so patch-created modules/files/Kconfig entries are visible to the map.
+   It is never an input to any compile drv.
+2. the map computes, per unit (=m module AND built-in obj-y directory —
+   built-ins are first-class units, registered as `builtin@<dir>`): dir,
+   objects, include closure, dep edges, and the unit's own patch subset
+   (creator dependencies resolved transitively; ancestor-dir Kconfig
+   patches reach every unit under them).
+3. every unit drv applies only its subset; the aggregate links.
+
+Classification (mapper `analyze_patches` v2):
+- **prepare-relevant** — ALSO applied in the shared prepare tree: root
+  Makefile/Kbuild, everything under scripts/, and the transitive include
+  closure of the prepare-time generated-header entry files
+  (`arch/<arch>/kernel/asm-offsets.c`, `kernel/bounds.c`). These feed
+every compilation by construction, so a change there legitimately
+  re-hashes all units (that is semantically correct, not a full tree
+  build - each unit rebuilds its own objects).
+- **localized** — everything else. Kconfig patches are NOT
+  prepare-relevant: the prepare tree's config deliberately drops symbols
+  whose Kconfig it does not carry, and affected units re-run syncconfig
+  inside their own copy (`copyTree`).
+- `copyTree` marks units whose subset cannot land in the cheap modsrc
+  scratch: a non-prepare patch touching paths outside the unit's
+  dir/extraDirs (kbuild's include search order makes a modsrc overlay
+  lose to srctree for angle includes), any Kconfig patch in the set, or
+  a unit whose dir/build files the patches create. copyTree units
+  reflink-copy the prepared build+source trees and apply their set there
+  (srctree = the copy). Built-in units ALWAYS run in a copy (in-tree
+  object targets need a writable objtree).
+- built-in units are tier-inert: they carry no dep edges (their keys
+  contain "@" and resolve at eval, so treating them like inert
+  `name@dir` twins would leave builtin<->module cycles alive — this bit
+  the first map build; the fix strips builtin deps before the SCC walk).
+
+Core (prepare-only): the stock kernel re-derived with ONLY the
+prepare-relevant host patches, reduced to `modules_prepare` (+ `dtbs` on
+aarch64 — DTS compiles, not kernel objects) via overrideAttrs. Outputs:
+`dev` = retained build tree (scripts, generated headers, module.lds),
+`source` = full patched source snapshot, `out` = dtbs (aarch64) / marker.
+No vmlinux, no Module.symvers, no kernel objects.
+
+Aggregate: derives from the FULLY patched kernel (its own sandbox applies
+every patch and generates the complete config — this is why units whose
+Kconfig patches were not carried by the prepare tree still resolve). The
+unit manifest is an INPUT listing every unit drv, so nix builds all
+units before the aggregate starts. preBuild seeds all stage-1 artifacts
+at canonical objtree paths; buildFlags = `[vmlinux]` — the built-in.a
+files are ar'ed from the seeded .o files and vmlinux is LINKED, not
+built. postBuild renames vmlinux.symvers → Module.symvers and runs
+`make modules` (the one global modpost over the seeded artifacts, then
+per-module ld / kmodigest / depmod via modules_install). pre/postInstall
+stash Module.symvers across the stock postInstall clean (not in its
+keepPaths) so the aggregate's `dev` is the retained real-kernel build
+tree (vmlinux + Module.symvers + full source) that out-of-tree modules
+(msm & co.) build against — the glue's assembled `dev` now points there.
+
+Verified on the stock 6.18.59 x86 config (fresh store, native):
+map builds green with 7548 units (259 built-ins, 0 copyTree, 0 patches),
+name-level Tarjan SCC check 0 multi-node SCCs, and the full eval surface
+(moduleCount / core / sample unit / aggregate) constructs clean through
+the fixpoint. Green reference: map
+`lj1r5j4n1x70zzpjyr41vn3kwcv6sj3n-linux-module-map-6.18.59`, core
+`fd25gfmbdqpybdwgphjkyv06i1caa059-linux-6.18.59`, aggregate
+`qh2nahiq4ar3l65bd0hkw8hkshv31q6v-linux-6.18.59`.
+
+## Known limitations (v2)
 
 - `$(eval $(foreach …))`-generated modules are invisible to the mapper
   (4 modules in the anchor config). The final drv still builds them.

@@ -239,8 +239,11 @@ def read_config(path):
             m = re.match(r"^# (CONFIG_[A-Za-z0-9_]+) is not set$", line)
             if m:
                 unset.add(m.group(1))
-    # `ifdef CONFIG_X` is true whenever the symbol is mentioned in .config,
-    # including "=n" (kconfig exports =n symbols into auto.conf).
+    # cfg = symbols with an explicit value (y/m from auto.conf-style files,
+    # n from `CONFIG_FOO=n` lines if present); unset = `# CONFIG_FOO is not
+    # set` symbols. $(CONFIG_FOO) for an unset symbol expands to "n"
+    # (equivalent to empty for obj- collection). `ifdef` evaluation lives in
+    # Dir.eval_cond, which mirrors real make against auto.conf (y/m only).
     return cfg, unset
 
 
@@ -292,9 +295,19 @@ class Dir:
                 name = em.group(1)
             if not re.match(r"^%s$" % IDENT, name):
                 return False, False
-            defined = (name.startswith("CONFIG_") and (name in cfg or name in unset)) or (
-                name in self.env and self.env[name]
-            )
+            if name.startswith("CONFIG_"):
+                # Real kbuild evaluates `ifdef` against auto.conf, which
+                # only exports symbols set to y or m; =n symbols are
+                # absent, so `ifdef CONFIG_FOO` is FALSE for unset
+                # (not-set) symbols. Evaluating against the full .config
+                # (which has `# CONFIG_FOO is not set` lines) would wrongly
+                # activate ifdef-guarded *-objs lines and make units
+                # compile objects whose config gate is off (e.g.
+                # cpci_hotplug_core.o colliding with the static-inline
+                # stub in cpci_hotplug.h).
+                defined = cfg.get(name) in ("y", "m")
+            else:
+                defined = name in self.env and bool(self.env[name])
             return True, defined
         pm = re.match(r"^\(\s*([^,]*?)\s*,\s*(.*?)\s*\)$", rest, re.S)
         if not pm:
@@ -352,8 +365,11 @@ def kbuild_file(d):
 
 
 class Mapper:
-    def __init__(self, srcdir, cfg, unset, arch):
+    def __init__(self, srcdir, cfg, unset, arch, origsrc=None):
         self.srcdir = srcdir
+        # the UNPATCHED upstream tree (if provided): copyTree detection checks
+        # whether a unit's dir and build files even exist before host patches
+        self.origsrc = origsrc
         self.cfg = cfg
         self.unset = unset
         self.arch = arch
@@ -364,6 +380,11 @@ class Mapper:
         self.absent = set()
         self.modules = OrderedDict()  # key -> module dict
         self.module_order = []
+        # Sources of built-in (obj-y) objects, used by patch classification
+        # to recognize prepare-time source reach.
+        self.builtin_objs = set()   # tree-relative object stem paths
+        self.builtin_files = set()  # existing source paths of those objects
+        self.patch_info = []        # per-patch classification (analyze_patches)
 
     def process_file(self, dirpath, fname):
         real = dirpath if dirpath == "" else os.path.normpath(dirpath)
@@ -540,8 +561,34 @@ class Mapper:
         if real == "" and fname == "Makefile":
             self.global_env = dict(d.env)
 
+    def _mark_builtin(self, objpath):
+        """Record a built-in object stem path and its existing sources."""
+        self.builtin_objs.add(objpath)
+        for ext in (".c", ".S", ".rs"):
+            if os.path.exists(os.path.join(self.srcdir, objpath + ext)):
+                self.builtin_files.add(objpath + ext)
+
+    def _record_builtin(self, d, real):
+        """obj-y objects - and the parts of composite objects whose
+        composite target is obj-y - are built into vmlinux. Record their
+        source paths so patch classification can keep core-feeding
+        patches out of the leaf class (Option A)."""
+        for tok in set(d.obj_y):
+            if tok.endswith("/"):
+                continue
+            stem = tok[:-2] if tok.endswith(".o") else tok
+            self._mark_builtin(os.path.normpath(os.path.join(real, stem)))
+            # composite object parts inherit the composite's y/m status
+            for part in d.obj_lists.get(stem, []):
+                if part.endswith("/"):
+                    continue
+                pstem = part[:-2] if part.endswith(".o") else part
+                self._mark_builtin(os.path.normpath(os.path.join(real, pstem)))
+
     def harvest(self, d, real):
         seen = set()
+        self._record_builtin(d, real)
+        self._register_builtin(d, real)
         for tok in d.obj_y + d.obj_m:
             if tok.endswith("/"):
                 sub = os.path.normpath(os.path.join(real, tok[:-1]))
@@ -568,6 +615,43 @@ class Mapper:
                 self.register_module(os.path.basename(stem), d, os.path.normpath(os.path.join(real, sub)))
             else:
                 self.register_module(stem, d, real)
+
+    def _register_builtin(self, d, real):
+        """obj-y objects are compile units of their own (no full tree build,
+        ever): every directory with built-in content becomes a per-directory
+        unit whose sandbox compiles exactly that directory's objects; the
+        aggregate seeds the artifacts and performs the vmlinux link.
+        Registered as a pseudo-module (name 'builtin@<dir>') so the uniform
+        machinery (dir fixes, include closures, patch applicability) applies
+        without special-casing downstream."""
+        objs = []
+        for tok in d.obj_y:
+            if tok.endswith("/"):
+                continue
+            stem = tok[:-2] if tok.endswith(".o") else tok
+            lst = d.obj_lists.get(stem)
+            if lst:
+                objs.extend(o for o in lst if not o.endswith("/"))
+            else:
+                objs.append(tok if tok.endswith(".o") else stem + ".o")
+        if not objs:
+            return
+        prev = self.modules.get("builtin@" + real)
+        if prev is not None:
+            self.warnings.append(f"{real}: duplicate built-in registration; merging")
+            prev["objects"] = prev["objects"] + [
+                o for o in objs if o not in prev["objects"]
+            ]
+            return
+        self.modules["builtin@" + real] = {
+            "name": "builtin@" + real,
+            "key": "builtin@" + real,
+            "builtin": True,
+            "dir": real,
+            "objects": objs,
+            "order": len(self.module_order),
+        }
+        self.module_order.append("builtin@" + real)
 
     def register_module(self, stem, d, real):
         objects = []
@@ -605,7 +689,11 @@ class Mapper:
                         srcs.append(p + ext)
                         break
                 else:
-                    self.warnings.append(f"{m['dir']}: no source found for object {obj}")
+                    if not m["name"].startswith("builtin@"):
+                        # generated objects (sed/gawk-produced .c/.S) have no
+                        # source in the tree; the in-tree make rules build them
+                        self.warnings.append(
+                            f"{m['dir']}: no source found for object {obj}")
             m["sources"] = srcs
 
     def fix_module_dirs(self):
@@ -626,6 +714,7 @@ class Mapper:
             if (os.path.exists(os.path.join(self.srcdir, base, "Makefile"))
                     or os.path.exists(os.path.join(self.srcdir, base, "Kbuild"))):
                 continue
+            m["preFixDir"] = base
             objects = m.get("objects") or []
             anc = os.path.dirname(base)
             while anc and anc not in ("", ".", "/"):
@@ -898,7 +987,278 @@ class Mapper:
                 if not file_frontier:
                     break
             m["extraDirs"] = sorted(seen_dirs - {base})
+            # Option A: the full transitive include closure (file level) is
+            # needed to decide which host patches a module must apply.
+            m["closureFiles"] = sorted(scanned_files)
 
+
+    # ---------- Option A: patch localization ----------
+
+    DIFFGIT_RE = re.compile(r'^diff --git (?:"?a/(.+?)"?) (?:"?b/(.+?)"?)$')
+    MINUS_RE = re.compile(r'^--- (?:"?a/(.+?)"?|/dev/null)(?:\t|$)')
+    PLUS_RE = re.compile(r'^\+\+\+ (?:"?b/(.+?)"?|/dev/null)(?:\t|$)')
+    BINARY_RE = re.compile(r'^Binary files .* and (?:"?b/(.+?)"?) differ$')
+
+    def analyze_patches(self, patches):
+        """Patch localization v2: every compile unit (module or built-in
+        directory) applies its own applicable patch subset; nothing builds
+        a full tree.
+
+        prepare-relevant -> ALSO applied in the shared prepare tree (the
+        modules_prepare output: scripts, generated headers). That is: the
+        root Makefile/Kbuild, everything under scripts/, and the
+        transitive include closure of the prepare-time generated-header
+        entry files (asm-offsets.c, bounds.c). These files feed every
+        compilation by construction, so carrying them in the prepare
+        baseline is correct - a change there legitimately re-hashes the
+        units that compile against them.
+        everything else   -> reaches units ONLY through their own sets.
+
+        Applicability is file/dir based: a unit gets a patch when a
+        touched path is one of its sources, sits in its include closure,
+        lies under its dir, or lies in one of its extraDirs. Kconfig
+        patches additionally reach every unit whose dir lies under the
+        Kconfig's dir (the unit's config symbols resolve only against the
+        patched Kconfig hierarchy). Creator dependencies (patch B modifies
+        a file patch A creates) are resolved into the same set
+        transitively, in patch-list order.
+
+        copyTree marks units whose patch set cannot land in the cheap
+        modsrc scratch:
+          * a NON-prepare patch touches paths outside the unit's
+            dir/extraDirs - the shared prepare tree does not carry them,
+            and kbuild's include search order makes a modsrc overlay lose
+            to srctree for angle includes, so the unit must compile with
+            srctree = its own patched copy of the tree;
+          * a Kconfig patch is in the set - the unit must re-run
+            syncconfig against its own patched Kconfigs (the prepare
+            tree's config deliberately drops symbols whose Kconfig the
+            prepare tree does not carry);
+          * the unit's dir (or its build file) is patch-created - there is
+            nothing upstream to seed the scratch from.
+        copyTree units reflink-copy the prepared build+source trees and
+        apply their set there (srctree = the copy). Built-in units always
+        run in a copy (their targets build in-tree, which needs a writable
+        objtree).
+        """
+        infos = []
+        for p in patches:
+            name, path = p["name"], p["file"]
+            if not path:
+                continue
+            try:
+                with open(path, "r", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                self.warnings.append(f"patch {name}: unreadable {path}; ignoring")
+                continue
+            touched = set()
+            creates = set()
+            pending_a = "unset"  # None = `--- /dev/null` seen (create)
+            for line in text.splitlines():
+                m = self.DIFFGIT_RE.match(line)
+                if m:
+                    touched.update((m.group(1), m.group(2)))
+                    pending_a = "unset"
+                    continue
+                m = self.MINUS_RE.match(line)
+                if m:
+                    pending_a = None if m.group(1) is None else m.group(1)
+                    if pending_a is not None:
+                        touched.add(pending_a)
+                    continue
+                m = self.PLUS_RE.match(line)
+                if m:
+                    tgt = m.group(1)
+                    if tgt is not None:
+                        touched.add(tgt)
+                        # modification keeps a == b; anything else (create
+                        # via /dev/null, rename via a/old b/new) is a new
+                        # file for the unpatched tree
+                        if pending_a != tgt:
+                            creates.add(tgt)
+                    pending_a = "unset"
+                    continue
+                m = self.BINARY_RE.match(line)
+                if m:
+                    touched.add(m.group(1))
+                    creates.add(m.group(1))
+            infos.append({
+                "name": name,
+                "file": path,
+                "touched": sorted(touched),
+                "creates": sorted(creates),
+            })
+
+        # creator dependencies (list order = patch application order)
+        created_by = {}
+        for p in infos:
+            for c in p["creates"]:
+                created_by.setdefault(c, p["name"])
+        for p in infos:
+            p["creatorDeps"] = sorted({
+                created_by[t]
+                for t in p["touched"]
+                if t in created_by and created_by[t] != p["name"]
+            })
+
+        # prepare vs localized: see the docstring. The prepare-time include
+        # closure is computed over the same include-resolution rules as
+        # detect_extra_dirs, seeded from the generated-header entry files.
+        arch_dirs = [self.arch]
+        if self.arch in ("x86_64", "i386", "i686"):
+            arch_dirs.append("x86")
+        prepare_closure = set()
+        for a in arch_dirs:
+            prepare_closure |= self.header_closure([
+                os.path.join("arch", a, "kernel", "asm-offsets.c"),
+                os.path.join("kernel", "bounds.c"),
+            ])
+        for p in infos:
+            prep = []
+            for t in p["touched"]:
+                if t in ("Makefile", "Kbuild"):
+                    prep.append(f"{t}: root build file")
+                elif t == "scripts" or t.startswith("scripts" + os.sep):
+                    prep.append(f"{t}: scripts")
+                elif t in prepare_closure:
+                    prep.append(f"{t}: prepare-time generated-header input")
+            p["prepare"] = bool(prep)
+            p["prepareReasons"] = prep
+            if prep:
+                self.warnings.append(
+                    f"patch {p['name']}: prepare-relevant "
+                    f"({'; '.join(prep[:3])}"
+                    f"{'; ...' if len(prep) > 3 else ''})")
+
+        # per-unit applicability
+        touch_by_name = {p["name"]: set(p["touched"]) for p in infos}
+        creator_deps = {p["name"]: set(p["creatorDeps"]) for p in infos}
+        for m in self.modules.values():
+            base = m["dir"]
+            srcs = set(m.get("sources") or [])
+            closure = set(m.get("closureFiles") or [])
+            extras = set(m.get("extraDirs") or [])
+            have = set()
+            for p in infos:
+                hit = False
+                for t in p["touched"]:
+                    if t in srcs or t in closure:
+                        hit = True
+                        break
+                    td = os.path.dirname(t)
+                    if td == base or td.startswith(base + os.sep):
+                        hit = True
+                        break
+                    if td in extras:
+                        hit = True
+                        break
+                    if (os.path.basename(t).startswith("Kconfig")
+                            and (td == "" or base.startswith(td + os.sep))):
+                        # Kconfig in an ancestor dir: the unit's config
+                        # symbols resolve only against the patched hierarchy
+                        hit = True
+                        break
+                if hit:
+                    have.add(p["name"])
+            # creator-dep transitive closure
+            changed = True
+            while changed:
+                changed = False
+                for nm in list(have):
+                    for dn in creator_deps.get(nm, ()):
+                        if dn not in have:
+                            have.add(dn)
+                            changed = True
+            m["patches"] = sorted(have)
+
+        # copyTree: which units cannot use the cheap modsrc scratch (see the
+        # method docstring). Built-in units always run in a copy.
+        patch_by_name = {p["name"]: p for p in infos}
+        creates_all = set()
+        for p in infos:
+            creates_all.update(p["creates"])
+        for m in self.modules.values():
+            base = m["dir"]
+            extras = set(m.get("extraDirs") or [])
+            have = set(m["patches"])
+            reasons = []
+            for nm in have:
+                pinfo = patch_by_name[nm]
+                for t in touch_by_name[nm]:
+                    td = os.path.dirname(t)
+                    if td == base or td.startswith(base + os.sep) or td in extras:
+                        continue
+                    if not pinfo["prepare"]:
+                        # a prepare patch reaches the unit through the
+                        # prepare tree (its modsrc hunks fail harmlessly);
+                        # anything else must come from the unit's own copy
+                        reasons.append(f"{nm}: {t} outside modsrc coverage")
+                if any(os.path.basename(t).startswith("Kconfig")
+                        for t in touch_by_name[nm]):
+                    reasons.append(f"{nm}: Kconfig patch (syncconfig in copy)")
+            for d2 in [x for x in (m.get("preFixDir"), base) if x]:
+                if self.origsrc:
+                    if not os.path.isdir(os.path.join(self.origsrc, d2)):
+                        reasons.append(f"{d2}: dir created by patches")
+                    elif not (
+                        os.path.exists(os.path.join(self.origsrc, d2, "Makefile"))
+                        or os.path.exists(os.path.join(self.origsrc, d2, "Kbuild"))
+                    ):
+                        reasons.append(f"{d2}: Makefile/Kbuild created by patches")
+            m["copyTree"] = bool(reasons) or bool(m.get("builtin"))
+            m["copyTreeReasons"] = reasons
+
+        self.patch_info = infos
+        nprep = sum(1 for p in infos if p["prepare"])
+        affected = sum(1 for m in self.modules.values() if m.get("patches"))
+        copied = sum(1 for m in self.modules.values() if m.get("copyTree"))
+        self.warnings.append(
+            f"patch analysis: {len(infos)} patches "
+            f"({nprep} prepare-relevant), "
+            f"{affected} units carry an applicable patch set, "
+            f"{copied} units run in a private tree copy")
+
+    def header_closure(self, entries):
+        """Transitive include closure over tree-relative paths, resolving
+        quoted includes relative to the including file and angle includes
+        through the kernel include roots (same over-approximation
+        philosophy as detect_extra_dirs)."""
+        roots = ["include"]
+        if self.arch == "x86_64" or self.arch == "i386" or self.arch == "i686":
+            roots.append(os.path.join("arch", "x86", "include"))
+        roots.append(os.path.join("arch", self.arch, "include"))
+        qre = re.compile(r'#\s*include\s+"([^"]+)"')
+        are = re.compile(r'#\s*include\s+<([^>]+)>')
+        seen = set()
+        frontier = list(entries)
+        while frontier:
+            rel = frontier.pop()
+            if rel in seen:
+                continue
+            seen.add(rel)
+            try:
+                with open(os.path.join(self.srcdir, rel), errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            fdir = os.path.dirname(rel)
+            incs = [(m.group(1), True) for m in qre.finditer(text)]
+            incs += [(m.group(1), False) for m in are.finditer(text)]
+            for inc, quoted in incs:
+                if inc.startswith("/"):
+                    continue
+                target = os.path.normpath(os.path.join(fdir, inc))
+                if os.path.exists(os.path.join(self.srcdir, target)):
+                    frontier.append(target)
+                    continue
+                if not quoted or "/" not in inc:
+                    for r in roots:
+                        t2 = os.path.normpath(os.path.join(r, inc))
+                        if os.path.exists(os.path.join(self.srcdir, t2)):
+                            frontier.append(t2)
+                            break
+        return seen
 
     def scan_exports_and_deps(self):
         mod_files = [(m["key"], [os.path.join(self.srcdir, s) for s in m["sources"]]) for m in self.modules.values()]
@@ -973,6 +1333,16 @@ class Mapper:
         dep list (consumers drop them); they cannot contribute cycles."""
         def name_of(k):
             return k.split("@", 1)[0]
+
+        # built-in units are tier-inert: they never consume dep artifacts,
+        # so they carry no edges. This must happen BEFORE the graph walk:
+        # their keys contain "@" and DO resolve at eval (the fixpoint attr
+        # key is the full "builtin@<dir>" name), so treating them like the
+        # inert "name@dir" twin keys would leave builtin<->module cycles
+        # alive in the output graph.
+        for m in self.modules.values():
+            if m.get("builtin"):
+                m["deps"] = []
 
         # deterministic name order = first registration
         names = {}
@@ -1099,7 +1469,7 @@ class Mapper:
             self.warnings.append(
                 f"dropped build-tree-bound modules: {sorted(dropped)}")
 
-    def run(self):
+    def run(self, patches=None):
         self.process_file("", "Makefile")
         if os.path.exists(os.path.join(self.srcdir, "Kbuild")):
             # root has two kbuild files; bypass the per-dir visited guard once
@@ -1112,6 +1482,12 @@ class Mapper:
         self.resolve_sources()
         self.fix_module_dirs()
         self.detect_extra_dirs()
+        if patches:
+            self.analyze_patches(patches)
+            # closureFiles is internal to classification - never serialized
+            # (7941 file lists would bloat the JSON the evaluator imports).
+            for m in self.modules.values():
+                m.pop("closureFiles", None)
         self.scan_exports_and_deps()
         self.prune_cycles()
         self.drop_build_tree_bound_modules()
@@ -1152,20 +1528,37 @@ def _scan_refs(paths):
 
 def main():
     srcdir, configfile, arch, outjson, outwarn = sys.argv[1:6]
+    # argv[6] is the patch manifest JSON text (passed via an env var),
+    # not a file path.
+    patches = json.loads(sys.argv[6]) if len(sys.argv) > 6 else []
+    # entries without a patch file (config-only entries like
+    # ec-qcom-hamoa-enable) carry nothing to classify or apply
+    patches = [p for p in patches if p.get("file")]
+    # argv[7] (optional): the UNPATCHED upstream tree - used by copyTree
+    # detection (units whose dirs/build files the patches create).
+    origsrc = sys.argv[7] if len(sys.argv) > 7 else None
     cfg, unset = read_config(configfile)
-    mapper = Mapper(srcdir, cfg, unset, arch)
-    mapper.run()
+    mapper = Mapper(srcdir, cfg, unset, arch, origsrc=origsrc)
+    mapper.run(patches)
+    nprep = sum(1 for p in mapper.patch_info if p["prepare"])
+    nbuiltin = sum(1 for m in mapper.modules.values() if m.get("builtin"))
+    ncopied = sum(1 for m in mapper.modules.values() if m.get("copyTree"))
     stats = {
         "arch": arch,
-        "modules": len(mapper.modules),
+        "units": len(mapper.modules),
+        "builtins": nbuiltin,
+        "copyTree": ncopied,
         "warnings": len(mapper.warnings),
         "absentConfigSymbols": len(mapper.absent),
+        "patches": len(mapper.patch_info),
+        "preparePatches": nprep,
     }
     out = {
         "stats": stats,
         "order": mapper.module_order,
         "modules": list(mapper.modules.values()),
         "noisySymbols": getattr(mapper, "noisySymbols", []),
+        "patches": mapper.patch_info,
     }
     with open(outjson, "w") as f:
         json.dump(out, f, indent=1)

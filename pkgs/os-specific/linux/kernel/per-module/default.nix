@@ -1,29 +1,65 @@
 # Per-module kernel packager (spike).
 #
-# Splits a nixpkgs kernel build into:
+# ABSOLUTE RULE: no full tree build, ever. Everything that compiles happens
+# in per-unit derivations - =m modules AND built-in (obj-y) directories -
+# and the final drv only links:
 #
-#   linux-core.drv         vmlinux + built-ins + modules_prepare/dev tree +
-#                          base Module.symvers (vmlinux exports) + a `src`
-#                          output with the full *patched* source tree
-#   linux-module-<name>.d  COMPILE-ONLY per in-tree module: stage-1 Kbuild
-#                          artifacts (.o, composite .o, .mod, .cmd files) in
-#                          the module's canonical dir layout, plus namespaced
-#                          accumulated outputs of its dependency modules
-#   linux.drv (aggregate)  union of all module outputs seeded into a build
-#                          tree, then resumed with `make modules
-#                          modules_install`: modpost runs exactly once over
-#                          everything, per-module ld / signing (kmodigest) /
-#                          depmod / modules.cer merge all happen here
-#   linux-image            the existing nixpkgs rebuild-image (insert-sys-cert
-#                          with the merged modules.cer) over the aggregate
+#   linux-patched-source    source-only drv: stock patches + every host
+#                           patch applied. The MAP's input - the walk sees
+#                           patch-created modules/files. Never an input to
+#                           any compile drv.
+#   linux-module-map.drv    mapper over the patched source: per-unit dir,
+#                           objects, include closures, dependency edges, and
+#                           per-unit patch subsets (prepare-relevant
+#                           classification + copyTree detection).
+#   linux-core.drv          prepare-ONLY: modules_prepare (+ dtbs on
+#                           aarch64) - zero kernel object compilation. The
+#                           shared baseline every unit compiles against.
+#   linux-module-<name>.d   COMPILE-ONLY per-unit stage-1 drv: seeds its
+#                           sources from the unpatched upstream tree (or a
+#                           reflink copy of the prepared build+source trees
+#                           when its patch set reaches outside the cheap
+#                           scratch) and applies its own applicable patch
+#                           subset.
+#   linux.drv (aggregate)   seeds every unit's stage-1 artifacts into its
+#                           own build tree, links vmlinux (built-in.a +
+#                           final link) and runs the ONE global modpass /
+#                           per-module ld / kmodigest signing / depmod over
+#                           everything. Unit artifacts are drv inputs, so
+#                           nix builds them all before the aggregate.
+#   linux-image             existing nixpkgs rebuild-image (insert-sys-cert
+#                           with the merged modules.cer) over the aggregate
 #
 # Design notes and verification status: see NOTES.md in this directory.
 {
   lib,
   stdenv,
+  stdenvNoCC,
   callPackage,
+  patch,
   writeText,
   kernel,
+  flex,
+  bison,
+  zlib,
+  # Stock kernelPackages set (pre-host-patches). Needed to re-derive the
+  # core kernel with ONLY prepare-relevant host patches (patch localization
+  # v2). null keeps the legacy behavior (core = the fully patched kernel).
+  kernelPackages ? null,
+  # Kernel-build customizations threaded from the NixOS boot machinery
+  # (must match what the glue applied to `kernel`).
+  randstructSeed ? "",
+  features ? { },
+  # Host-level patches (attrsets {name, patch} or plain paths). The mapper
+  # classifies them prepare-relevant vs localized and computes per-unit
+  # applicability.
+  kernelPatches ? [ ],
+  # The stock kernel's own patches - re-applied automatically by the
+  # override merge when coreKernel is re-derived; passed so the patched
+  # source/map can stage them and the classifier can recognize them
+  # (basePatches that reach unit sets are harmless: --forward skips
+  # already-applied hunks).
+  basePatches ? [ ],
   kernelModuleMakeFlags ? kernel.commonMakeFlags ++ [
     "DEPMOD=true"
     "INSTALL_MOD_STRIP=1"
@@ -56,8 +92,156 @@ let
   # recompiles uncovered modules internally) and the subset manifest changes
   # the aggregate's drv identity, fragmenting the one drv that matters for
   # cache reuse. See NOTES.md.
-  mapDrv = callPackage ./mapper.nix { inherit kernel; };
+  # Host-level patches, normalized for the mapper and the module drvs.
+  # normalized patch entry with the RAW value kept: config-only entries
+  # (no patch/file) normalize to null and are dropped where consumed.
+  # toString'd paths lose context - the raw PATH VALUE is what every
+  # drv-attr interpolation must use (path values always register inputs).
+  normPatch =
+    p:
+    let
+      raw = if lib.isAttrs p then (p.patch or p.file or null) else p;
+    in
+    if raw == null then null else { name = p.name or (baseNameOf raw); file = toString raw; raw = raw; };
+  hostPatches = lib.filter (p: p != null) (map normPatch kernelPatches);
+  patchFile = builtins.listToAttrs (
+    map (p: lib.nameValuePair p.name p.file) hostPatches
+  );
+
+  # Sandbox-safe staged filename component (shared with mapper.nix's
+  # staging convention).
+  safeName =
+    n: lib.stringAsChars (c: if builtins.match "[A-Za-z0-9._-]" c == null then "_" else c) n;
+
+  # Fully patched source tree: the stock kernel's own patches plus every
+  # host patch, applied at the tree root. THE MAP'S INPUT ONLY - it is
+  # never an input to any compile drv (per-unit drvs apply their own
+  # subsets to the unpatched upstream tree or to a reflink copy of the
+  # prepare trees), so a patch edit re-hashes the map drv (a cheap walk)
+  # plus the affected units - never the world.
+  patchedSource =
+    let
+      stageLines = lib.concatImapStrings (
+        i: p: ''
+          cp ${patchRaw.${p.name}} "patches/${toString i}-${safeName p.name}.patch"
+        ''
+      ) usablePatches;
+    in
+    stdenvNoCC.mkDerivation {
+      pname = "linux-${version}-patched-source";
+      inherit version;
+      src = kernel.src;
+      dontBuild = true;
+      dontFixup = true;
+      nativeBuildInputs = [ patch ];
+      env.patchOrder = lib.concatStringsSep " " (
+        lib.imap1 (
+          i: p: "patches/${toString i}-${safeName p.name}.patch"
+        ) usablePatches
+      );
+      installPhase = ''
+        runHook preInstall
+        mkdir -p patches
+        ${stageLines}
+        # locate the unpacked tree (genericBuild cds into the source root,
+        # so the relative $sourceRoot may no longer resolve from here)
+        srct=""
+        if [ -d "$sourceRoot" ]; then srct="$sourceRoot";
+        elif [ -d "./$sourceRoot" ]; then srct="./$sourceRoot";
+        elif [ -f "Makefile" ] && [ -f "Kbuild" ]; then srct="$PWD"; fi
+        [ -n "$srct" ] || { echo "cannot locate kernel source tree" >&2; exit 1; }
+        # apply strictly: a patch that fails here is a packaging error
+        for p in $patchOrder; do
+          patch --forward -p1 -d "$srct" < "$p"
+        done
+        mkdir -p "$out"
+        cp -a --reflink=auto "$srct/." "$out/"
+        runHook postInstall
+      '';
+    };
+
+  mapDrv = callPackage ./mapper.nix {
+    inherit kernel;
+    # the PATCHED source: the map must see patch-created modules/files
+    src = patchedSource;
+    # the unpatched upstream tree: copyTree detection
+    origSrc = unpackedSource;
+    # RAW patch values (nix paths, not toString'd strings) - mapper.nix
+    # needs the path context to register the files as derivation inputs.
+    # MERGED list, stock patches first (application order) so per-unit sets
+    # can carry base-patch hunks that touch unit dirs (the modsrc seed is
+    # unpatched upstream).
+    patches = lib.unique usablePatches;
+  };
   moduleMap = builtins.fromJSON (builtins.readFile "${mapDrv}/modules.json");
+
+  # normalized patch entries with RAW values (paths keep context), stock
+  # patches first (application order); config-only entries dropped
+  usablePatches = lib.filter (p: p != null) (
+    lib.unique (map normPatch (basePatches ++ kernelPatches))
+  );
+
+  # name -> raw patch value (real path value with context, for drv inputs)
+  patchRaw = builtins.listToAttrs (
+    map (p: lib.nameValuePair p.name p.raw) usablePatches
+  );
+
+  # Patch localization v2: prepare-relevant host patches (root build files,
+  # scripts/, prepare-time generated-header closure) also feed the prepare
+  # tree via the override merge; every other patch reaches units ONLY
+  # through their own per-unit subsets, applied inside the unit's compile
+  # drv. basePatches are the stock kernel's own - they are part of kernel
+  # identity, so unit sets that include them are harmless (the copy case
+  # skips already-applied hunks via `patch --forward`; the common case
+  # applies them to the unpatched modsrc exactly once).
+  prepareNames = map (p: p.name) (
+    lib.filter (p: p.prepare or false) (moduleMap.patches or [ ])
+  );
+  baseNames = map (p: p.name) (
+    lib.filter (p: p != null) (map normPatch basePatches)
+  );
+  prepareHostPatches = lib.filter (
+    p: lib.elem p.name prepareNames && !lib.elem p.name baseNames
+  ) hostPatches;
+
+  # The prepare-only core: the stock kernel re-derived with ONLY the
+  # prepare-relevant host patches (its own patches merge in via override),
+  # reduced to modules_prepare - zero kernel object compilation. A host
+  # patch edit re-hashes the prepare tree only when the mapper classified
+  # it prepare-relevant; everything else localizes to the affected units.
+  coreKernel =
+    if kernelPackages == null then
+      kernel
+    else
+      kernelPackages.kernel.override (orig: {
+        inherit randstructSeed;
+        kernelPatches = (orig.kernelPatches or [ ]) ++ prepareHostPatches;
+        features = lib.recursiveUpdate (orig.features or { }) features;
+      });
+
+  # Unpatched upstream source tree: what every module compile drv seeds its
+  # modsrc from. Identity depends on the source tarball only - patch edits
+  # do not touch this drv, and all modules share one copy of the tree.
+  unpackedSource = stdenvNoCC.mkDerivation {
+    pname = "linux-${version}-unpatched-source";
+    inherit version;
+    src = kernel.src;
+    dontBuild = true;
+    dontFixup = true;
+    installPhase = ''
+      runHook preInstall
+      # locate the tree: genericBuild cds into the unpacked source root, so
+      # the relative $sourceRoot may no longer resolve from here
+      srct=""
+      if [ -d "$sourceRoot" ]; then srct="$sourceRoot";
+      elif [ -d "./$sourceRoot" ]; then srct="./$sourceRoot";
+      elif [ -f "Makefile" ] && [ -f "Kbuild" ]; then srct="$PWD"; fi
+      [ -n "$srct" ] || { echo "cannot locate kernel source tree" >&2; exit 1; }
+      mkdir -p "$out"
+      cp -a --reflink=auto "$srct/." "$out/"
+      runHook postInstall
+    '';
+  };
 
   # Make flags for the compile-only module drvs. Same toolchain wiring as the
   # core build so recorded command lines stay comparable across the two
@@ -73,63 +257,76 @@ let
       "--eval=undefine src"
     ];
 
-  core = kernel.overrideAttrs (old: {
+  # Prepare-only core: zero kernel object compilation (ABSOLUTE RULE - no
+  # full tree build, ever). modules_prepare compiles the host build tools
+  # and generates the interface every unit compiles against: scripts/,
+  # include/generated (autoconf, asm-offsets), scripts/module.lds. The
+  # device trees on aarch64 are DTS compiles, not kernel objects. vmlinux,
+  # the built-in .o files and Module.symvers are produced by the
+  # aggregate's link step over the seeded per-unit artifacts.
+  core = coreKernel.overrideAttrs (old: {
     outputs = [ "out" "dev" "source" ];
     buildFlags =
-      [ kernel.target "scripts_gdb" ]
+      [ "modules_prepare" ]
       ++ lib.optionals kernel.buildDTBs [ "dtbs" ];
-    postBuild = ''
-      # kernel 6.18+ generates scripts/module.lds only under
-      # modules_prepare (not run by the core-only build); downstream
-      # modpost/modfinal need it in the retained build tree. All prepare
-      # steps are up to date here, so this only generates the lds.
-      make "''${makeFlags[@]}" modules_prepare
-    '';
-    # Stock build.nix appends `modules_install` (dropped here: the
-    # aggregate replaces it) AND `dtbs_install` when buildDTBs — the latter
-    # drop was accidental. aarch64 consumers reach the dtbs through
-    # hardware.deviceTree.dtbSource = ${kernelPackage}/dtbs, and
-    # INSTALL_DTBS_PATH already targets $out/dtbs, so restore it. On x86
-    # (buildDTBs = false) the list stays identical to the old one.
-    installTargets =
-      [ (kernel.installTargetFor kernel.target) ]
-      ++ lib.optionals kernel.buildDTBs [ "dtbs_install" ];
+    # NB: modules_prepare itself builds the host tools the per-object
+    # compiles need (objtool, resolve_btfids) - they end up in the retained
+    # tree below, so unit sandboxes never descend into the tools chain.
+    # no boot image here (that is the aggregate's link step), so the stock
+    # installTargets' image install is replaced wholesale below; the dtbs
+    # install on aarch64 lands in $out/dtbs (INSTALL_DTBS_PATH)
+    installTargets = lib.optionals kernel.buildDTBs [ "dtbs_install" ];
     preInstall = (old.preInstall or "") + ''
-      # Stash files that this kernel's `make clean` (run by postInstall)
-      # removes but downstream modpost/modfinal need:
-      #   scripts/module.lds - prerequisite of the %.ko rule; when missing,
-      #     make rejects the pattern rule with "No rule to make target
-      #     '<module>.ko'"
-      #   Module.symvers     - the core's vmlinux exports
-      cp "$buildRoot/scripts/module.lds" "$NIX_BUILD_TOP/module.lds.stash" 2>/dev/null || true
-      # without KBUILD_MODULES the vmlinux-only modpost writes
-      # vmlinux.symvers; downstream expects Module.symvers
-      if [ -f "$buildRoot/Module.symvers" ]; then
-        cp "$buildRoot/Module.symvers" "$NIX_BUILD_TOP/Module.symvers.stash"
-      elif [ -f "$buildRoot/vmlinux.symvers" ]; then
-        cp "$buildRoot/vmlinux.symvers" "$NIX_BUILD_TOP/Module.symvers.stash"
-      fi
-      # Snapshot the full patched source before postInstall prunes the dev
-      # tree (drivers are deleted there). Per-module compile drvs compile
-      # against this tree, so they are consistent with the core by
-      # construction and never need to re-apply kernel patches.
+      # Snapshot the full patched source before the dev-tree handling.
+      # Copy-case units seed their private trees from here.
       # NB: the output is named "source", not "src" - an output named src
       # would shadow the src attribute (env var) and break unpacking.
-      # NB2: use the absolute path; after unpack genericBuild has cd'd into
-      # sourceRoot, so $PWD is already .../source.
+      # NB2: the source unpacks straight into dev/lib/modules/<ver>/source
+      # (build.nix preUnpack/postUnpack), so it is complete at preInstall.
       mkdir -p "${placeholder "source"}"
       cp -a --reflink=auto "$dev/lib/modules/${modDirVersion}/source/." "${placeholder "source"}/"
     '';
-    postInstall = (old.postInstall or "") + ''
-      # Restore the stashed module-linking interface files into the
-      # retained build tree.
-      if [ -f "$NIX_BUILD_TOP/module.lds.stash" ]; then
-        mkdir -p "$dev/lib/modules/${modDirVersion}/build/scripts"
-        cp "$NIX_BUILD_TOP/module.lds.stash" "$dev/lib/modules/${modDirVersion}/build/scripts/module.lds"
-      fi
-      if [ -f "$NIX_BUILD_TOP/Module.symvers.stash" ]; then
-        cp "$NIX_BUILD_TOP/Module.symvers.stash" "$dev/lib/modules/${modDirVersion}/build/Module.symvers"
-      fi
+    installPhase = ''
+      runHook preInstall
+      ${lib.optionalString kernel.buildDTBs ''
+        make "''${makeFlags[@]}" dtbs_install
+      ''}
+      mkdir -p "$out"
+      touch "$out/.prepare-only"
+      runHook postInstall
+    '';
+    # Retain the build tree UNCLEANED. The stock postInstall runs `make
+    # clean` and keeps only a keepPaths list - that deletes the generated
+    # files (scripts/kconfig sources, include/{config,generated}) that the
+    # out-of-tree-style per-unit make invocations would otherwise
+    # regenerate with host tools (flex, bison) the unit sandboxes do not
+    # carry. The modules_prepare output is exactly what the units need.
+    postInstall = ''
+      # Retain the build tree UNCLEANED. The stock postInstall runs `make
+      # clean` and keeps only a keepPaths list - that deletes the generated
+      # files (scripts/kconfig sources, include/{config,generated}) that the
+      # out-of-tree-style per-unit make invocations would otherwise
+      # regenerate with host tools (flex, bison) the unit sandboxes do not
+      # carry. The modules_prepare output is exactly what the units need.
+      mkdir -p "$dev/lib/modules/${modDirVersion}"
+      mv "$buildRoot" "$dev/lib/modules/${modDirVersion}/build"
+      # regenerate the outputmakefile shim at the retained paths
+      buildRoot="$dev/lib/modules/${modDirVersion}/build"
+      make "''${makeFlags[@]}" outputmakefile
+      # dereference the .config symlink into a real file: its target (the
+      # configfile drv) is NOT an input of the unit drv sandboxes, where the
+      # dangling symlink makes make treat the config as missing and rerun
+      # syncconfig - which prompts for patch-added symbols and rebuilds the
+      # kconfig host tools. A real file carries the fully settled config.
+      cp -L "$buildRoot/.config" "$NIX_BUILD_TOP/.config.real"
+      mv -f "$NIX_BUILD_TOP/.config.real" "$buildRoot/.config"
+      # keep the config state strictly newer than the dereferenced .config:
+      # a unit-side make with a newer .config would rerun syncconfig, whose
+      # prompts for patch-added symbols die on the sandbox's closed stdin
+      sleep 1.1
+      touch "$buildRoot/include/config/auto.conf" \
+        "$buildRoot/include/config/auto.conf.cmd" \
+        "$buildRoot/include/generated/autoconf.h"
     '';
   });
 
@@ -170,12 +367,19 @@ let
       pname = "linux-module-${m.name}";
       inherit version;
 
-      # No src unpack: sources come from the core's patched source output.
+      # No src unpack: sources come from the unpatched upstream source drv,
+      # and the module's own applicable patches are applied in buildPhase.
       dontUnpack = true;
 
       outputs = [ "out" ];
 
-      nativeBuildInputs = kernel.moduleBuildDependencies;
+      # The kernel's FULL nativeBuildInputs (not just moduleBuildDependencies):
+      # built-in and copy-case units run out-of-tree style make, whose prepare
+      # chain carries FORCE-prerequisite rules for the host tools (objtool,
+      # resolve_btfids, sign-file) - make remakes them EVERY time regardless
+      # of mtimes, so the sandbox must carry their link deps (zlib, elfutils,
+      # openssl). Plus patch (the tool) and flex/bison for kconfig regen.
+      nativeBuildInputs = kernel.nativeBuildInputs ++ kernel.moduleBuildDependencies ++ [ patch flex bison zlib ];
 
       # Dependency modules as sandbox inputs. Their outputs are only needed
       # by consumers (the module-level tier reads accumulated dep objects);
@@ -183,7 +387,27 @@ let
       # no symbol resolution below the final drv).
       env = {
         coreDev = "${core.dev}";
-        coreSource = "${core.source}";
+        # Patch localization v2: the unit seeds its sources from the
+        # unpatched upstream tree (common case) or from a reflink copy of
+        # the prepare trees (copy case) and applies its own applicable
+        # patch subset. Nothing consumes a fully-patched tree.
+        moduleSource = "${unpackedSource}";
+        isBuiltin = if (m.builtin or false) then "1" else "";
+        needsCopyTree = if (m.copyTree or false) then "1" else "";
+        # built-in units compile in-tree object targets (srctree-relative,
+        # no M=); the artifacts land in the objtree, which the copy case
+        # makes writable
+        builtinTargets = lib.concatStringsSep " " (
+          map (o: "${m.dir}/${o}") (m.objects or [ ])
+        );
+        # staged patch filenames (relative to the build sandbox cwd; the
+        # buildPhase copies each patchRaw file under these names before
+        # applying them). concatImapStrings in the buildPhase is 1-based.
+        modulePatches = lib.concatStringsSep " " (
+          lib.imap1 (
+            i: nm: "${toString i}-${safeName nm}.patch"
+          ) (m.patches or [ ])
+        );
         depsList = lib.concatMapStringsSep " " (p: "${p.drv}") presentDeps;
         depManifest = lib.concatStringsSep "\n" (
           map (p: "${p.name}\t${p.drv}") presentDeps
@@ -194,23 +418,15 @@ let
         let
           copyExtra = lib.concatStringsSep "\n" (
             map (d: ''
-              if [ -d "$coreSource/${d}" ]; then
+              if [ -d "$moduleSource/${d}" ]; then
                 mkdir -p "modsrc/${d}"
-                cp -a --reflink=auto "$coreSource/${d}/." "modsrc/${d}/"
-                chmod -R u+w "modsrc/${d}"
-              elif [ -d "$coreDev/lib/modules/${modDirVersion}/source/${d}" ]; then
-                # The retained dev source tree is the patched source with
-                # include/ and the kept headers - use it when the snapshot
-                # output predates a source-layout change (e.g. a snapshot
-                # taken before include/ was retained).
-                mkdir -p "modsrc/${d}"
-                cp -a --reflink=auto "$coreDev/lib/modules/${modDirVersion}/source/${d}/." "modsrc/${d}/"
+                cp -a --reflink=auto "$moduleSource/${d}/." "modsrc/${d}/"
                 chmod -R u+w "modsrc/${d}"
               else
-                # Over-approximated include root that neither tree has:
-                # resolution falls back to srctree (angle includes resolve
-                # via kbuild's own -I paths).
-                echo "per-module: extraDir ${d} absent from core source and dev source; skipping" >&2
+                # Over-approximated include root the unpatched tree does not
+                # have (e.g. a dir a patch creates): the unit is copyTree in
+                # that case, so the scratch fallback never runs without it.
+                echo "per-module: extraDir ${d} absent from unpatched source; skipping" >&2
               fi
             '') extraDirs
           );
@@ -222,56 +438,145 @@ let
           extraIncludeFlags = lib.concatMapStringsSep " " (
             d: "-I$PWD/modsrc/${d}"
           ) extraDirs;
+          # Writable private trees for copy-case units: reflink copies of
+          # the prepared build (objtree) and source (srctree) trees, with
+          # the build tree's outputmakefile shim repointed at the copy.
+          stagePrivateTree = ''
+            cp -a --reflink=auto "$coreDev/lib/modules/${modDirVersion}/build/." "$PWD/build/"
+            cp -a --reflink=auto "$coreDev/lib/modules/${modDirVersion}/source/." "$PWD/source/"
+            chmod -R u+w build source
+            sed -i \
+              -e "s|^export KBUILD_OUTPUT.*|export KBUILD_OUTPUT = $PWD/build|" \
+              -e "s|^include .*|include $PWD/source/Makefile|" \
+              "$PWD/build/Makefile"
+            # the .cmd files record the core's absolute paths; without
+            # NOCMDDEP every command line differs from the saved one and the
+            # out-of-tree make regenerates the full prepare chain.
+            export KBUILD_NOCMDDEP=1
+            # The store normalizes every file mtime to one SOURCE_DATE_EPOCH;
+            # with a uniform tree GNU make reruns the whole prepare chain.
+            # cp -a preserves the core's natural artifact ordering, so the
+            # ONLY stamp needed pushes SOURCES two days into the past:
+            # artifacts keep their real build times (strictly newer) and
+            # NOTHING is in the future - future timestamps trip make's
+            # clock-skew logic and force a prepare0 regen that needs bc.
+            find "$PWD/build" -type f \( \
+              -name '*.c' -o -name '*.h' -o -name '*.S' -o -name '*.l' \
+              -o -name '*.y' -o -name '*.sh' -o -name '*.py' \
+              -o -name '*.tbl' -o -name '*.pl' \
+              -o -name 'Kconfig*' -o -name 'Makefile*' -o -name 'Kbuild' \) \
+              -exec touch -d "@$((SOURCE_DATE_EPOCH - 172800))" {} +
+            find "$PWD/source" -type f \
+              -exec touch -d "@$((SOURCE_DATE_EPOCH - 172800))" {} +
+          '';
+          applyUnitPatches = ''
+            applyUnitPatches() {
+              for p in $modulePatches; do
+                patch --forward -d "$1" -p1 < "$p" || true
+              done
+            }
+          '';
         in
         ''
           runHook preBuild
 
           coreBuild="$coreDev/lib/modules/${modDirVersion}/build"
 
-          # stage 1 for exactly this module: sources in the canonical
-          # in-tree layout, output written next to them by `make M=`
-          mkdir -p "modsrc/${m.dir}"
-          # contents form: the destination may already exist (module dirs
-          # nested inside extraDirs); cp -a SRC DST would nest otherwise.
-          # Store paths are read-only: chmod after every copy so later
-          # copies can overwrite and the build can write its artifacts.
-          cp -a --reflink=auto "$coreSource/${m.dir}/." "modsrc/${m.dir}/"
-          chmod -R u+w modsrc
-          ${copyExtra}
-          chmod -R u+w modsrc
+          # stage this unit's applicable patch files (raw path
+          # interpolation registers each as a derivation input; see the
+          # nativeBuildInputs note)
+          mkdir -p patches
+          ${lib.concatImapStrings (
+            i: nm: ''
+              cp ${patchRaw.${nm}} "patches/${toString i}-${safeName nm}.patch"
+            ''
+          ) (m.patches or [ ])}
+          ${applyUnitPatches}
 
-          # compile only: the object target stops Kbuild right after the
-          # stage-1 build phase (objects + composite link + <mod>.mod).
-          # No modpost, no .ko link, no signing - all of that happens in the
-          # final aggregate drv.
-          #
-          # KCFLAGS=-I<pwd>/modsrc/a/b: tracepoint headers resolve relative
-          # to the source root (include/trace/define_trace.h includes
-          # ../../<module dir>/<trace>.h) and the pruned store source does
-          # not contain the module dir; a two-level probe dir makes the -I
-          # search land on the modsrc tree (X/../../ == modsrc).
-          # ownDirIncludeFirst: the module's trace header lives in the
-          # module dir itself; in-tree the define_trace re-include
-          # resolves via -I$(src) (per-file CFLAGS_<f>.o, e.g.
-          # mac802154's CFLAGS_trace.o). The own-dir -I must precede the
-          # extraDir entries so a sibling module's same-named trace
-          # header cannot shadow the module's own system.
-          # parentDirInclude: the module uses angle includes with a ../
-          # escape (mtip32xx: <../drivers/ata/ahci.h>); gcc resolves
-          # <...> only through -I roots, and the a/b probe only serves
-          # TWO-level escapes (a/b/../../ == modsrc). The one-level
-          # probe is modsrc/a: a/.. == modsrc for ANY module depth
-          # (a parent-of-dir probe fails at depth != 2:
-          # modsrc/drivers/block/mtip32xx/../.. == modsrc/drivers).
-          # NOTE: comments must sit BEFORE the make line - inside the
-          # backslash-continued command a '#' would comment out every
-          # remaining argument, including KCFLAGS, M= and the target.
-          mkdir -p modsrc/a/b
-          make -C "$coreBuild" -j"$NIX_BUILD_CORES" \
-            ${quotedFlags} \
-            "KCFLAGS=${lib.optionalString (m.ownDirIncludeFirst or false) "-I$PWD/modsrc/${m.dir} "}${lib.optionalString (m.parentDirInclude or false) "-I$PWD/modsrc/a "}-I$PWD/modsrc/a/b ${extraIncludeFlags}" \
-            "M=$PWD/modsrc/${m.dir}" \
-            ${lib.escapeShellArg target}
+          if [ -n "$isBuiltin" ]; then
+            # BUILT-IN unit: obj-y object targets build in-tree (no M=),
+            # which needs a writable objtree - always a private copy of the
+            # prepared trees. srctree = the (patched) source copy, so angle
+            # includes resolve canonically; no KCFLAGS tricks needed.
+            # BUILT-IN unit: obj-y object targets build in-tree (no M=),
+            # which needs a writable objtree - always a private copy of the
+            # prepared trees. srctree = the (patched) source copy, so angle
+            # includes resolve canonically; no KCFLAGS tricks needed.
+            ${stagePrivateTree}
+            applyUnitPatches "$PWD/source"
+            # -j1 is REQUIRED here, not a slowdown trade-off: the silent
+            # syncconfig (the store normalizes all core mtimes to one epoch,
+            # so .config and auto.conf compare equal) rewrites
+            # include/config/auto.conf.cmd, which make treats as a changed
+            # included makefile and re-executes itself; under -jN the old
+            # make's in-flight object job races the re-executed make's job on
+            # the same .d file and fixdep intermittently fails with
+            # "No such file or directory". Sequential passes cannot race.
+            make -C "$PWD/build" --no-print-directory -j1 \
+              ${quotedFlags} \
+              $builtinTargets
+            selfSrc="$PWD/build/${m.dir}"
+          elif [ -n "$needsCopyTree" ]; then
+            # COPY-CASE module: the patch set reaches outside the modsrc
+            # coverage (or needs its own syncconfig after Kconfig patches) -
+            # srctree = the unit's own patched copy of the source tree
+            ${stagePrivateTree}
+            applyUnitPatches "$PWD/source"
+            make -C "$PWD/build" --no-print-directory -j1 \
+              ${quotedFlags} \
+              "M=$PWD/source/${m.dir}" \
+              ${lib.escapeShellArg target}
+            selfSrc="$PWD/source/${m.dir}"
+          else
+            # COMMON case: stage 1 for exactly this module: sources in the
+            # canonical in-tree layout, output written next to them by
+            # `make M=`
+            mkdir -p "modsrc/${m.dir}"
+            # contents form: the destination may already exist (module dirs
+            # nested inside extraDirs); cp -a SRC DST would nest otherwise.
+            # Store paths are read-only: chmod after every copy so later
+            # copies can overwrite and the build can write its artifacts.
+            cp -a --reflink=auto "$moduleSource/${m.dir}/." "modsrc/${m.dir}/"
+            chmod -R u+w modsrc
+            ${copyExtra}
+            chmod -R u+w modsrc
+            applyUnitPatches "$PWD/modsrc"
+            chmod -R u+w modsrc
+
+            # compile only: the object target stops Kbuild right after the
+            # stage-1 build phase (objects + composite link + <mod>.mod).
+            # No modpost, no .ko link, no signing - all of that happens in the
+            # final aggregate drv.
+            #
+            # KCFLAGS=-I<pwd>/modsrc/a/b: tracepoint headers resolve relative
+            # to the source root (include/trace/define_trace.h includes
+            # ../../<module dir>/<trace>.h) and the pruned store source does
+            # not contain the module dir; a two-level probe dir makes the -I
+            # search land on the modsrc tree (X/../../ == modsrc).
+            # ownDirIncludeFirst: the module's trace header lives in the
+            # module dir itself; in-tree the define_trace re-include
+            # resolves via -I$(src) (per-file CFLAGS_<f>.o, e.g.
+            # mac802154's CFLAGS_trace.o). The own-dir -I must precede the
+            # extraDir entries so a sibling module's same-named trace
+            # header cannot shadow the module's own system.
+            # parentDirInclude: the module uses angle includes with a ../
+            # escape (mtip32xx: <../drivers/ata/ahci.h>); gcc resolves
+            # <...> only through -I roots, and the a/b probe only serves
+            # TWO-level escapes (a/b/../../ == modsrc). The one-level
+            # probe is modsrc/a: a/.. == modsrc for ANY module depth
+            # (a parent-of-dir probe fails at depth != 2:
+            # modsrc/drivers/block/mtip32xx/../.. == modsrc/drivers).
+            # NOTE: comments must sit BEFORE the make line - inside the
+            # backslash-continued command a '#' would comment out every
+            # remaining argument, including KCFLAGS, M= and the target.
+            mkdir -p modsrc/a/b
+            make -C "$coreBuild" -j"$NIX_BUILD_CORES" \
+              ${quotedFlags} \
+              "KCFLAGS=${lib.optionalString (m.ownDirIncludeFirst or false) "-I$PWD/modsrc/${m.dir} "}${lib.optionalString (m.parentDirInclude or false) "-I$PWD/modsrc/a "}-I$PWD/modsrc/a/b ${extraIncludeFlags}" \
+              "M=$PWD/modsrc/${m.dir}" \
+              ${lib.escapeShellArg target}
+            selfSrc="$PWD/modsrc/${m.dir}"
+          fi
 
           runHook postBuild
         '';
@@ -279,12 +584,14 @@ let
       installPhase = ''
         runHook preInstall
 
-        # Ship the module dir's stage-1 artifacts plus its sources (sources
+        # Ship the built dir's stage-1 artifacts plus its sources (sources
         # keep the layout byte-identical for consumers that resume the
         # build, e.g. the module-level tier). Stage-2 outputs must not
         # exist with the object-only target, but filter defensively.
+        # selfSrc was set in buildPhase: the objtree dir for built-in
+        # units, the source copy for copy-case modules, modsrc otherwise.
         mkdir -p "$out/self"
-        cp -a --reflink=auto "modsrc/${m.dir}/." "$out/self/"
+        cp -a --reflink=auto "$selfSrc/." "$out/self/"
         # NB: keep modules.order - Kbuild generates per-directory
         # modules.order files in-tree, so it is both correct for the
         # aggregate resume and required by the tier's MODORDER.
@@ -346,28 +653,22 @@ let
 
   aggregate = kernel.overrideAttrs (old: {
     outputs = [ "out" "dev" "modules" ];
-    buildFlags = [ "modules" ];
+    # vmlinux FIRST: the vmlinux-only modpost writes vmlinux.symvers, which
+    # the global modules modpost consumes as Module.symvers (postBuild).
+    # Every object the vmlinux link needs is seeded from per-unit drvs, so
+    # this is a link, not a build - built-in.a (ar) and the final ld only.
+    buildFlags = [ "vmlinux" ];
     installTargets = [ "modules_install" ];
     env = old.env or { } // {
-      coreDev = "${core.dev}";
       moduleManifest = "${moduleManifest}";
     };
     preBuild = (old.preBuild or "") + ''
-      # Seed the build tree with the core's prepared tree (vmlinux,
-      # Module.symvers, scripts, generated headers) and every module's
-      # stage-1 artifacts at their canonical in-tree paths. Kbuild then
-      # finds all objects up to date and runs straight through modpost (once,
-      # globally), the per-module links, modinst signing and depmod.
-      #
-      # KBUILD_NOCMDDEP=1 drops the saved-command-line comparison; under
-      # Nix epoch timestamps nothing is "newer than" anything else, so the
-      # remaining rebuild triggers are only missing artifacts - which make
-      # then builds here (correct, just not per-module cached).
-      cp -a "$coreDev/lib/modules/${modDirVersion}/build/." "$buildRoot/"
-      # the copied tree carries store-path permissions (read-only); make
-      # it writable BEFORE seeding module artifacts into it
-      chmod -R u+w "$buildRoot"
-
+      # Seed every compile unit's stage-1 artifacts at their canonical
+      # objtree paths. The unit manifest is an input that lists every unit
+      # drv (modules AND built-in dirs), so nix builds all of them before
+      # this drv: the aggregate NEVER compiles a full tree - only the
+      # documented build-tree-bound leftovers (kheaders and kin) plus the
+      # modpost/link/sign steps.
       while IFS=$'\t' read -r modOut modDir modName; do
         [ -n "$modOut" ] || continue
         mkdir -p "$buildRoot/$modDir"
@@ -377,6 +678,26 @@ let
       chmod -R u+w "$buildRoot"
 
       export KBUILD_NOCMDDEP=1
+    '';
+    postBuild = (old.postBuild or "") + ''
+      # vmlinux-only modpost wrote vmlinux.symvers; the global modules
+      # modpost expects it as Module.symvers (the same rename the old core
+      # used for its stash).
+      if [ -f "$buildRoot/vmlinux.symvers" ] && [ ! -f "$buildRoot/Module.symvers" ]; then
+        cp "$buildRoot/vmlinux.symvers" "$buildRoot/Module.symvers"
+      fi
+      make "''${makeFlags[@]}" -j"$NIX_BUILD_CORES" modules
+    '';
+    preInstall = (old.preInstall or "") + ''
+      # the stock postInstall's clean drops Module.symvers (it is not in
+      # the keepPaths list) - out-of-tree modules need it
+      cp "$buildRoot/Module.symvers" "$NIX_BUILD_TOP/Module.symvers.stash" 2>/dev/null || true
+    '';
+    postInstall = (old.postInstall or "") + ''
+      if [ -f "$NIX_BUILD_TOP/Module.symvers.stash" ]; then
+        mkdir -p "$dev/lib/modules/${modDirVersion}/build"
+        cp "$NIX_BUILD_TOP/Module.symvers.stash" "$dev/lib/modules/${modDirVersion}/build/Module.symvers"
+      fi
     '';
   });
 
@@ -430,7 +751,18 @@ let
       moduleMap
       mapDrv
       ;
+    # unit count: =m modules AND built-in directories - every unit is a drv
     moduleCount = builtins.length moduleMap.modules;
+    builtinCount = builtins.length (
+      lib.filter (m: m.builtin or false) moduleMap.modules
+    );
+    copyTreeCount = builtins.length (
+      lib.filter (m: m.copyTree or false) moduleMap.modules
+    );
+    # patch localization diagnostics: the prepare-relevant host patches the
+    # prepare tree carries, and the mapper's full classification
+    preparePatches = prepareHostPatches;
+    patchInfo = moduleMap.patches or [ ];
   };
 in
 passthru
