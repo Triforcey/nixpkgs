@@ -847,18 +847,43 @@ class Mapper:
                         elif not quoted or "/" not in inc:
                             # Unresolved bare-name or angle include:
                             # resolved via the collected -I$(srctree)
-                            # include roots.
-                            cd = next(
-                                (c for c in candidates
-                                 if os.path.exists(
-                                     os.path.join(self.srcdir, c, inc))),
-                                None,
-                            )
-                            if cd:
-                                if cd not in seen_dirs:
-                                    seen_dirs.add(cd)
-                                files_nxt.append(os.path.normpath(
-                                    os.path.join(cd, inc)))
+                            # include roots. For ANGLE includes carrying
+                            # an explicit ../ escape the including file's
+                            # dir is NOT a gcc search root (<...> ignores
+                            # it); in-tree they resolve through the
+                            # kbuild global -I$(srctree)/include root
+                            # (mtip32xx: <../drivers/ata/ahci.h> joins to
+                            # drivers/ata/ahci.h), and the pruned
+                            # compile-time source may lack the target.
+                            # Probe the module dir and the global include
+                            # root too, and record the JOINED dir (a ../
+                            # join lands OUTSIDE the probed root).
+                            roots = list(candidates)
+                            if not quoted and inc.startswith(".."):
+                                roots += [base, "include"]
+                            for c in roots:
+                                t2 = os.path.normpath(
+                                    os.path.join(c, inc))
+                                if os.path.exists(
+                                        os.path.join(self.srcdir, t2)):
+                                    if inc.startswith(".."):
+                                        # ../ escapes the probed root; the
+                                        # file's canonical dir is what
+                                        # modsrc must carry. Sandbox -I
+                                        # resolution goes through the
+                                        # modsrc-rooted probe dirs
+                                        # (a/b/.. == modsrc), not through
+                                        # an -I entry for this dir.
+                                        td = os.path.dirname(t2)
+                                    else:
+                                        # the root doubles as the sandbox
+                                        # -I entry: -I<dir> + <inc> hits
+                                        # the copied file.
+                                        td = c
+                                    if td and td not in seen_dirs:
+                                        seen_dirs.add(td)
+                                    files_nxt.append(t2)
+                                    break
                 file_frontier = files_nxt
                 if not file_frontier:
                     break
