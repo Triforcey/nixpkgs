@@ -834,6 +834,16 @@ class Mapper:
                     for inc, quoted in incs:
                         if inc.startswith("/"):
                             continue
+                        if not quoted and inc.startswith(".."):
+                            # Angle includes with a ../ escape are resolved
+                            # by gcc ONLY through -I roots (the including
+                            # file's dir is not searched for <...>). The
+                            # sandbox needs an -I root whose parent is
+                            # modsrc so '../X' lands on modsrc/X: the drv
+                            # adds -I$PWD/modsrc/<dir>/.. when this flag
+                            # is set (the a/b probe only serves two-level
+                            # escapes: a/b/../../ == modsrc).
+                            m["parentDirInclude"] = True
                         target = os.path.normpath(os.path.join(fdir, inc))
                         if os.path.exists(os.path.join(self.srcdir, target)):
                             if (target != base

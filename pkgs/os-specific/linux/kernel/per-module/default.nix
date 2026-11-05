@@ -256,13 +256,19 @@ let
           # mac802154's CFLAGS_trace.o). The own-dir -I must precede the
           # extraDir entries so a sibling module's same-named trace
           # header cannot shadow the module's own system.
+          # parentDirInclude: the module uses angle includes with a ../
+          # escape (mtip32xx: <../drivers/ata/ahci.h>); gcc resolves
+          # <...> only through -I roots, and the a/b probe only serves
+          # TWO-level escapes (a/b/../../ == modsrc). A root whose parent
+          # is modsrc makes ONE-level escapes land on modsrc: modsrc/
+          # <dir>/../ + ../X == modsrc/X.
           # NOTE: comments must sit BEFORE the make line - inside the
           # backslash-continued command a '#' would comment out every
           # remaining argument, including KCFLAGS, M= and the target.
           mkdir -p modsrc/a/b
           make -C "$coreBuild" -j"$NIX_BUILD_CORES" \
             ${quotedFlags} \
-            "KCFLAGS=${lib.optionalString (m.ownDirIncludeFirst or false) "-I$PWD/modsrc/${m.dir} "}-I$PWD/modsrc/a/b ${extraIncludeFlags}" \
+            "KCFLAGS=${lib.optionalString (m.ownDirIncludeFirst or false) "-I$PWD/modsrc/${m.dir} "}${lib.optionalString (m.parentDirInclude or false) "-I$PWD/modsrc/${m.dir}/.. "}-I$PWD/modsrc/a/b ${extraIncludeFlags}" \
             "M=$PWD/modsrc/${m.dir}" \
             ${lib.escapeShellArg target}
 
