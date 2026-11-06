@@ -115,6 +115,16 @@ def expand(s, ctx, depth=0):
 
 
 def eval_ref(inner, ctx, depth):
+    im = re.match(r"^if\s+(.*)$", inner, re.S)
+    if im:
+        # $(if cond,then[,else]): a non-empty (stripped) cond expands to
+        # then, otherwise to else (default empty). Needed for the kernel's
+        # obj-$(if $(CONFIG_KUNIT),y) += hooks.o idiom - hooks.o is built-in
+        # whenever KUnit is enabled (y OR m) and the line is dead otherwise.
+        args = split_args(im.group(1), ctx, depth, 3)
+        if args[0].strip():
+            return args[1] if len(args) > 1 else ""
+        return args[2] if len(args) > 2 else ""
     m = re.match(r"^(%s)\s+(.*)$" % "|".join(sorted(FUNCS_1 | FUNCS_2 | FUNCS_3)), inner, re.S)
     if m:
         func, rest = m.group(1), m.group(2)
@@ -166,7 +176,13 @@ def eval_ref(inner, ctx, depth):
         if name in ctx.cfg:
             return ctx.cfg[name]
         if name in ctx.unset:
-            return "n"
+            # "is not set" symbols are NOT exported by auto.conf, so real
+            # Kbuild's $(CONFIG_X) is EMPTY for them - not "n". Returning
+            # "n" made truthiness contexts like $(if $(CONFIG_KUNIT),y)
+            # evaluate TRUE and wrongly collected hooks.o into the builtin
+            # unit. Empty is exact for obj- collection too (obj-n and obj-
+            # are both dropped).
+            return ""
         # Symbol absent from .config: kconfig does not export it at all, so
         # $(CONFIG_X) expands to the empty string in real Kbuild. Exact
         # behaviour, not an approximation.
@@ -241,9 +257,11 @@ def read_config(path):
                 unset.add(m.group(1))
     # cfg = symbols with an explicit value (y/m from auto.conf-style files,
     # n from `CONFIG_FOO=n` lines if present); unset = `# CONFIG_FOO is not
-    # set` symbols. $(CONFIG_FOO) for an unset symbol expands to "n"
-    # (equivalent to empty for obj- collection). `ifdef` evaluation lives in
-    # Dir.eval_cond, which mirrors real make against auto.conf (y/m only).
+    # set` symbols. auto.conf exports ONLY y/m symbols, so $(CONFIG_FOO) for
+    # an unset symbol is EMPTY in real Kbuild - eval_ref returns "" for it
+    # (a truthy "n" would make $(if $(CONFIG_FOO),y) evaluate TRUE).
+    # `ifdef` evaluation lives in Dir.eval_cond, which mirrors real make
+    # against auto.conf (y/m only).
     return cfg, unset
 
 
