@@ -522,6 +522,24 @@ radius diff (old vs new modules.json rows), offline name-level Tarjan
 SCC check over the new map's deps, invariance eval (core + unaffected
 units byte-identical), then a kvm-family unit smoke build.
 
+## Kernel-root-relative rule prerequisites: rootRelTargets (fixed 2026-11-06)
+
+Module-unit single-module builds run kbuild's M= machinery, whose
+sub-make CWD is the MODULE dir. Rule prerequisites written
+kernel-root-relative (scsi_mod: `$(obj)/scsi_devinfo_tbl.c:
+include/scsi/scsi_devinfo.h` - a sed-generated source) resolve against
+that CWD and die with "No rule to make target" in the real build's
+kernel-root CWD they resolve fine. drivers/scsi/Makefile is the only
+Makefile in the tree with this pattern - 52 units share its Makefile and
+all need the staging.
+
+Fix: the mapper scans module Makefiles for `$(obj)/...:` rule
+prerequisites that are tree paths outside the module dir resolving to
+real source-tree files, records them as `rootRelTargets`, and the unit
+drv stages file symlinks into modsrc (`modsrc/<dir>/<path> ->`
+`$coreBuild/.../source/<path>`) so the CWD-relative lookup hits the
+retained source copy.
+
 ## Known limitations (v2)
 
 - `$(eval $(foreach …))`-generated modules are invisible to the mapper

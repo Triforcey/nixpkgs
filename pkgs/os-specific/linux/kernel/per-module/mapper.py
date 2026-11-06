@@ -29,6 +29,7 @@ IDENT = r"[A-Za-z0-9_]+"
 
 ASSIGN_RE = re.compile(r"^([A-Za-z0-9_$(){\}\.\-/, \t]+)\s*(::?|\+|\?)?=\s*(.*)$")
 COND_RE = re.compile(r"^(ifeq|ifneq|ifdef|ifndef)\b\s*(.*)$")
+RULE_PREREQ_RE = re.compile(r'^\$\((?:obj|src)\)/[^\s:]+:\s*(\S+)', re.M)
 EXPORT_RE = re.compile(r"\bEXPORT_SYMBOL(?:_[A-Za-z0-9_]*)?\s*\(\s*([A-Za-z_]\w*)")
 TOKEN_RE = re.compile(r"[A-Za-z_]\w*")
 
@@ -941,6 +942,28 @@ class Mapper:
                         if (cdir and cdir not in candidates
                                 and os.path.isdir(os.path.join(self.srcdir, cdir))):
                             candidates.append(cdir)
+
+            # Kernel-root-relative rule prerequisites (scsi_mod:
+            # \$(obj)/scsi_devinfo_tbl.c: include/scsi/scsi_devinfo.h).
+            # Real kbuild resolves them against the make CWD - the kernel
+            # root - but the unit's single-module sub-make runs with the
+            # MODULE dir as CWD, where the pruned core tree lacks them;
+            # the drv stages file symlinks into modsrc for these.
+            root_rel = set()
+            for mk in ("Makefile", "Kbuild"):
+                try:
+                    with open(os.path.join(self.srcdir, base, mk), errors="replace") as f:
+                        mktext = re.sub(r"\\\\\s*\n", " ", f.read())
+                except OSError:
+                    continue
+                for mm in RULE_PREREQ_RE.finditer(mktext):
+                    tok = mm.group(1)
+                    if tok.startswith("$(") or tok.startswith(base + os.sep):
+                        continue
+                    if os.path.isfile(os.path.join(self.srcdir, tok)):
+                        root_rel.add(tok)
+            if root_rel:
+                m["rootRelTargets"] = sorted(root_rel)
 
             # subdir-ccflags-y in ancestor Makefiles (kbuild propagates it
             # to all descendants; M= builds of the module dir never read

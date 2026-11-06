@@ -433,6 +433,10 @@ let
           + lib.optionalString (lib.versionOlder version "7.0")
             " --remap-path-prefix=${core.dev}/lib/modules/${modDirVersion}/source/= --remap-path-scope=macro"
         );
+      } // lib.optionalAttrs ((m.rootRelTargets or [ ]) != [ ]) {
+        # Kernel-root-relative rule prerequisites the drv stages as
+        # modsrc file symlinks (scsi_mod: include/scsi/scsi_devinfo.h).
+        rootRelTargets = lib.concatStringsSep " " (m.rootRelTargets or [ ]);
       };
 
       buildPhase =
@@ -590,6 +594,19 @@ let
             # NOTE: comments must sit BEFORE the make line - inside the
             # backslash-continued command a '#' would comment out every
             # remaining argument, including KCFLAGS, M= and the target.
+            ${lib.optionalString ((m.rootRelTargets or [ ]) != [ ]) ''
+              # Kernel-root-relative rule prerequisites (scsi_mod:
+              # \$(obj)/scsi_devinfo_tbl.c: include/scsi/scsi_devinfo.h)
+              # resolve against the sub-make's CWD - the module dir -
+              # where the pruned core tree lacks them. Stage file
+              # symlinks into modsrc so the relative paths hit the
+              # retained source copy.
+              for t in $rootRelTargets; do
+                mkdir -p "modsrc/${m.dir}/$(dirname "$t")"
+                ln -sfn "$coreBuild/lib/modules/${modDirVersion}/source/$t" \
+                  "modsrc/${m.dir}/$t"
+              done
+            ''}
             mkdir -p modsrc/a/b
             make -C "$coreBuild" -j"$NIX_BUILD_CORES" \
               ${quotedFlags} \
