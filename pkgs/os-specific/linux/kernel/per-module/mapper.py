@@ -404,10 +404,10 @@ class Mapper:
         self.builtin_files = set()  # existing source paths of those objects
         self.patch_info = []        # per-patch classification (analyze_patches)
 
-    def process_file(self, dirpath, fname):
+    def process_file(self, dirpath, fname, splice_into=None):
         real = dirpath if dirpath == "" else os.path.normpath(dirpath)
         path = os.path.join(self.srcdir, real, fname) if fname else os.path.join(self.srcdir, real)
-        fkey = (real, fname)
+        fkey = (real, fname) if splice_into is None else (real, fname, id(splice_into))
         if fkey in self.processed:
             return
         try:
@@ -417,13 +417,22 @@ class Mapper:
             self.warnings.append(f"{real}: missing kbuild file {fname}")
             return
         self.processed.add(fkey)
-        d = Dir(real)
-        d.env["SRCARCH"] = self.arch
-        d.env["ARCH"] = self.arch
-        d.env["srctree"] = "."
-        d.env["src"] = real
-        d.env["obj"] = real
-        d.env.update(self.global_env)
+        if splice_into is None:
+            d = Dir(real)
+            d.env["SRCARCH"] = self.arch
+            d.env["ARCH"] = self.arch
+            d.env["srctree"] = "."
+            d.env["src"] = real
+            d.env["obj"] = real
+            d.env.update(self.global_env)
+        else:
+            # make's `include` splices the fragment into the INCLUDING
+            # makefile's instance: variables and *-y lists are shared with
+            # the parent's parse state (kvm: virt/kvm/Makefile.kvm defines
+            # kvm-y += $(KVM)/kvm_main.o, consumed by arch/x86/kvm).
+            # $(src)/$(obj) stay the parent's, exactly as in the real
+            # make instance.
+            d = splice_into
 
         # join backslash continuations into single logical lines
         lines = []
@@ -471,13 +480,23 @@ class Mapper:
                         continue
                     incx = incx.strip('"')
                     base = os.path.basename(incx)
-                    if base in ("Makefile", "Kbuild") or base.endswith(".mk"):
+                    # Makefile.<suffix> fragments (Makefile.kvm, lib/vdso's
+                    # Makefile.include, ...) are real kbuild include
+                    # targets; dropping them silently lost their obj lists
+                    # (kvm died with "No rule to make target
+                    # '../../../virt/kvm/kvm_main.o'"). Infra fragments
+                    # (scripts/Makefile.compiler & co) define helper
+                    # "functions" referenced only WITH arguments, which
+                    # eval_ref treats as unresolvable regardless - splicing
+                    # them is inert.
+                    if (base in ("Makefile", "Kbuild") or base.endswith(".mk")
+                            or base.startswith("Makefile.")):
                         incdir = os.path.dirname(incx)
                         if incdir and not incx.startswith("/"):
                             incdir = os.path.normpath(os.path.join(real, incdir))
                         elif not incdir:
                             incdir = real
-                        self.process_file(incdir, base)
+                        self.process_file(incdir, base, splice_into=d)
                 continue
 
             # variable assignments (strip an optional leading `export`)
@@ -615,6 +634,11 @@ class Mapper:
                             d.obj_y.append(tx)
                 continue
 
+        if splice_into is not None:
+            # The parent's own tail registers/records the merged state; a
+            # spliced fragment must not harvest (its real dir differs from
+            # the state's owner) or promote the root env.
+            return
         # process collected entries
         self.harvest(d, real)
         # remember the root Makefile env as global (ARCH_CORE, libs-y, ... are
@@ -1053,6 +1077,15 @@ class Mapper:
                 file_frontier = files_nxt
                 if not file_frontier:
                     break
+            # Object tokens may escape the module dir via ../ paths
+            # (kvm-y := $(KVM)/kvm_main.o from virt/kvm/Makefile.kvm): the
+            # escaped sources must be staged into modsrc at their tree
+            # paths so the M= build's relative ../../../ references
+            # resolve to copied files.
+            for s in m.get("sources") or [ ]:
+                sd = os.path.dirname(s)
+                if sd and not (sd == m["dir"] or sd.startswith(m["dir"] + os.sep)):
+                    seen_dirs.add(sd)
             m["extraDirs"] = sorted(seen_dirs - {base})
             # Option A: the full transitive include closure (file level) is
             # needed to decide which host patches a module must apply.

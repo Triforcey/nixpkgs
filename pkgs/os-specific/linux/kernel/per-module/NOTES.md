@@ -488,6 +488,40 @@ var the core build had, or the silent syncconfig rewrites auto.conf /
 rustc_cfg differently and the seeded artifacts diverge from the recorded
 commands.
 
+## Included Makefile.* fragments: splice + escaped object dirs (fixed 2026-11-06)
+
+Kbuild modules can source their object lists from fragments in OTHER
+directories: arch/x86/kvm/Makefile does `include
+$(srctree)/virt/kvm/Makefile.kvm`, whose `kvm-y := $(KVM)/kvm_main.o ...`
+(with `KVM ?= ../../../virt/kvm`) supplies the module's core objects.
+The include filter accepted only Makefile/Kbuild/*.mk basenames, so
+Makefile.kvm was silently dropped: kvm's map row had 20 in-dir objects
+and none of the virt/kvm ones, the unit's M= build demanded
+`../../../virt/kvm/kvm_main.o` from modsrc and died with
+"No rule to make target" (retry 10's single root failure).
+
+Two-part fix in mapper.py:
+
+1. `Makefile.*` fragments are now processed AND spliced into the
+   INCLUDING dir's parse state (`process_file(..., splice_into=d)`):
+   make's include is textual - variables and *-y lists are shared with
+   the parent instance, and $(src)/$(obj) stay the parent's. The spliced
+   fragment skips harvest/root-env promotion (the parent's tail handles
+   the merged state); dedup keys carry the parent identity so a second
+   includer still gets its own splice. Infra fragments
+   (scripts/Makefile.compiler & co) define helper "functions" referenced
+   only WITH arguments, which eval_ref treats as unresolvable
+   regardless - splicing them is inert.
+2. extraDirs gains the containing dirs of sources that escape the
+   module dir (resolve_sources normpath-collapses ../ tokens), so the
+   unit's modsrc staging carries virt/kvm and the M= build's relative
+   ../../../ references resolve to copied files.
+
+Verification gates for any future include-splice change: map blast
+radius diff (old vs new modules.json rows), offline name-level Tarjan
+SCC check over the new map's deps, invariance eval (core + unaffected
+units byte-identical), then a kvm-family unit smoke build.
+
 ## Known limitations (v2)
 
 - `$(eval $(foreach …))`-generated modules are invisible to the mapper
