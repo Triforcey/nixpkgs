@@ -456,6 +456,38 @@ the fixpoint. Green reference: map
 `fd25gfmbdqpybdwgphjkyv06i1caa059-linux-6.18.59`, aggregate
 `qh2nahiq4ar3l65bd0hkw8hkshv31q6v-linux-6.18.59`.
 
+## Unit sandbox kconfig re-probes: rust env (fixed 2026-11-06)
+
+Every unit's silent syncconfig re-evaluates the Kconfig probes in the UNIT
+sandbox. `scripts/rust_is_available.sh` needs `RUSTC`/`BINDGEN`/`CC` in
+the exported env (kernel Makefile tool defaults + the unit's quotedFlags
+cover these) AND the core stdlib source via `RUST_LIB_SRC` - the nixpkgs
+rustc sysroot fallback path does not exist, and only the core build had
+the env (build.nix). Probe failure means `RUST_IS_AVAILABLE=n`, so
+CONFIG_RUST (plus BLK_DEV_RUST_NULL, CPUFREQ_DT_RUST,
+DRM_PANIC_*_QR_CODE) drop out of the regenerated
+`include/generated/rustc_cfg`, and the rust objects then rebuild with a
+command that gates `#![feature(compiler_builtins)]` behind an
+allow-features list lacking it: E0725+E0658 on
+rust/compiler_builtins.rs. (The executed command differs from the
+recorded core command - failed commands never rewrite the stale .cmd, so
+diffing .cmd files shows them identical; compare the regenerated
+rustc_cfg instead: 16 rust cfg lines missing.)
+
+Fix: units whose `sources` include `.rs` inherit `RUST_LIB_SRC` and a
+`KRUSTFLAGS` mirror from `core.env` (KRUSTFLAGS computed against
+`core.dev` = the exact path the core's placeholder-dev expanded to, so
+the recomputed rustc command stays byte-identical to the core build's
+recorded one). 6.18.59 x86 map: 4 units gated (builtin@rust,
+builtin@drivers/gpu/drm, rnull_mod, rcpufreq_dt); every other unit drv
+keeps its byte-identical identity.
+
+General rule: ANY Kconfig `$(success,...)` probe is env-sensitive at
+unit re-sync time - the unit env must reproduce every probe-relevant env
+var the core build had, or the silent syncconfig rewrites auto.conf /
+rustc_cfg differently and the seeded artifacts diverge from the recorded
+commands.
+
 ## Known limitations (v2)
 
 - `$(eval $(foreach …))`-generated modules are invisible to the mapper

@@ -412,6 +412,27 @@ let
         depManifest = lib.concatStringsSep "\n" (
           map (p: "${p.name}\t${p.drv}") presentDeps
         );
+      } // lib.optionalAttrs (lib.any (s: lib.hasSuffix ".rs" s) (m.sources or [ ])) {
+        # The unit's silent syncconfig re-runs the Kconfig probes in THIS
+        # sandbox, and scripts/rust_is_available.sh checks the 'core'
+        # stdlib source via RUST_LIB_SRC (the sysroot fallback does not
+        # exist in nixpkgs rustc). Without it RUST_IS_AVAILABLE goes n and
+        # every rust cfg drops out of the regenerated
+        # include/generated/rustc_cfg; the rust objects then rebuild
+        # broken (E0725 on rust/compiler_builtins.rs). Source both vars
+        # from the core drv's env, which the core build exported.
+        RUST_LIB_SRC = (core.env or { }).RUST_LIB_SRC or "";
+        # Mirror build.nix's KRUSTFLAGS so the recomputed rustc command
+        # stays byte-identical to the core build's recorded one (resume
+        # fidelity); against coreDev, whose path is exactly what the
+        # core's placeholder-dev expanded to.
+        KRUSTFLAGS = lib.optionalString (
+          (core.env or { }).RUST_LIB_SRC or "" != ""
+        ) (
+          "--remap-path-prefix ${(core.env or { }).RUST_LIB_SRC}=/"
+          + lib.optionalString (lib.versionOlder version "7.0")
+            " --remap-path-prefix=${core.dev}/lib/modules/${modDirVersion}/source/= --remap-path-scope=macro"
+        );
       };
 
       buildPhase =
