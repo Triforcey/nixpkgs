@@ -890,7 +890,8 @@ class Mapper:
         inc_angle_re = re.compile(r'#\s*include\s+<([^>]+)>')
         # -I flags, tolerating space between -I and the argument (kernel
         # Makefiles write both "-I$(src)/.." and "-I $(src)").
-        flag_re = re.compile(r'-I\s*\$\((src|srctree)\)/?([^\s\\]*)')
+        flag_re = re.compile(
+            r'-I\s*\$\((src|srctree)\)/?([^\s\\]*)|-I\s*([A-Za-z0-9_./][^\s\\]*)')
         max_depth = 8
         for m in self.modules.values():
             base = m["dir"]
@@ -900,11 +901,32 @@ class Mapper:
             for mk in ("Makefile", "Kbuild"):
                 try:
                     with open(os.path.join(self.srcdir, base, mk), errors="replace") as f:
-                        mktext = f.read()
+                        # Join backslash continuations: flag_re matches per
+                        # line and a -I on a continuation line (qtnfmac:
+                        # ccflags-y += \  -Idrivers/...) would be missed.
+                        mktext = re.sub(r"\\\\\s*\n", " ", f.read())
                 except OSError:
                     continue
                 for mm in flag_re.finditer(mktext):
                     kind, rest = mm.group(1), mm.group(2)
+                    if kind is None and mm.group(3):
+                        # Plain tree-relative -I path (qtnfmac: ccflags-y
+                        # += \  -Idrivers/net/wireless/quantenna/qtnfmac,
+                        # with a pcie/ source bare-including shm_ipc.h
+                        # from the dir root). Real kbuild resolves it
+                        # against the make CWD - the pruned core tree,
+                        # where the module dir is absent - so modsrc must
+                        # carry it and the drv must emit the own-dir -I
+                        # when the path IS the module dir (extraDirs
+                        # excludes base).
+                        pdir = os.path.normpath(mm.group(3).rstrip("/\\"))
+                        if pdir == base:
+                            m["ownDirIncludeFirst"] = True
+                        elif (pdir.startswith(base + os.sep)
+                                and os.path.isdir(
+                                    os.path.join(self.srcdir, pdir))):
+                            seen_dirs.add(pdir)
+                        continue
                     if kind == "src":
                         # $(src) is the module dir in an M= build: the flag
                         # resolves inside modsrc once the named dir exists.
@@ -928,7 +950,8 @@ class Mapper:
                 for mk in ("Makefile", "Kbuild"):
                     try:
                         with open(os.path.join(self.srcdir, anc, mk), errors="replace") as f:
-                            mktext = f.read()
+                            # Join backslash continuations (see above).
+                            mktext = re.sub(r"\\\\\s*\n", " ", f.read())
                     except OSError:
                         continue
                     for ln in mktext.splitlines():
@@ -936,6 +959,21 @@ class Mapper:
                             continue
                         for mm in flag_re.finditer(ln):
                             kind, rest = mm.group(1), mm.group(2)
+                            if kind is None and mm.group(3):
+                                # Plain tree-relative -I path in an
+                                # ancestor's subdir-ccflags-y: tree paths,
+                                # resolved against the make CWD; same
+                                # own-dir handling as above.
+                                pdir = os.path.normpath(
+                                    mm.group(3).rstrip("/\\"))
+                                if pdir == base:
+                                    m["ownDirIncludeFirst"] = True
+                                elif (pdir.startswith(base + os.sep)
+                                        and os.path.isdir(
+                                            os.path.join(self.srcdir,
+                                                         pdir))):
+                                    seen_dirs.add(pdir)
+                                continue
                             if kind == "src":
                                 rdir = os.path.normpath(
                                     os.path.join(anc, rest) if rest else anc)
@@ -1093,6 +1131,20 @@ class Mapper:
                                         td = c
                                     if td and td not in seen_dirs:
                                         seen_dirs.add(td)
+                                    if td == base:
+                                        # The -I root IS the module dir
+                                        # itself (qtnfmac: ccflags-y +=
+                                        # -Idrivers/.../qtnfmac and a
+                                        # pcie/ source bare-includes
+                                        # shm_ipc.h from the dir root).
+                                        # modsrc carries the dir, but no
+                                        # extraDir -I is emitted for it
+                                        # (extraDirs excludes base) and
+                                        # the unit's own -I<tree path>
+                                        # resolves against the pruned
+                                        # core tree CWD - so the drv must
+                                        # place -I$PWD/modsrc/<dir> first.
+                                        m["ownDirIncludeFirst"] = True
                                     files_nxt.append(t2)
                                     break
                 file_frontier = files_nxt
