@@ -602,8 +602,14 @@ class Mapper:
                 dirs = []
                 for t in rhsx.split():
                     (dirs if t.endswith("/") else objs).append(t)
-                if suffix in ("", "n") and not dirs:
-                    # e.g. netfilter-$(CONFIG_X) with X=n/unset: no-op
+                if suffix in ("", "n"):
+                    # netfilter-$(CONFIG_X) with X=n/unset: real kbuild drops
+                    # the whole line - obj tokens AND dir walk tokens. The
+                    # dir-walk extension below (d.obj_y.extend) otherwise
+                    # harvested config-gated dirs (arch/x86/math-emu with
+                    # CONFIG_MATH_EMULATION absent on x86_64) as builtin
+                    # units and broke their compiles. Suffix-y lines (libs-y,
+                    # drivers-$(CONFIG_PCI=y)) are unaffected.
                     continue
                 # Dir tokens in *-y vars are vmlinux/module walk lists
                 # (core-y, libs-y, drivers-y, ...); walk them like obj-y.
