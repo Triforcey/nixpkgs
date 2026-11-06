@@ -492,11 +492,26 @@ class Mapper:
                     if (base in ("Makefile", "Kbuild") or base.endswith(".mk")
                             or base.startswith("Makefile.")):
                         incdir = os.path.dirname(incx)
-                        if incdir and not incx.startswith("/"):
-                            incdir = os.path.normpath(os.path.join(real, incdir))
-                        elif not incdir:
-                            incdir = real
-                        self.process_file(incdir, base, splice_into=d)
+                        if not incdir:
+                            cands = [real]
+                        elif incx.startswith("/"):
+                            cands = [incdir]
+                        else:
+                            # make resolves includes against the make
+                            # instance's cwd - the kernel root for every
+                            # kbuild sub-make. $(srctree)-relative
+                            # fragments (virt/kvm, lib/vdso) and
+                            # $(src)-relative ones (arch/arm/mach-s3c)
+                            # both occur; try the tree root first, then
+                            # the including dir.
+                            cands = [os.path.normpath(incdir),
+                                     os.path.normpath(os.path.join(real, incdir))]
+                        chosen = cands[0]
+                        for c in cands:
+                            if os.path.exists(os.path.join(self.srcdir, c, base)):
+                                chosen = c
+                                break
+                        self.process_file(chosen, base, splice_into=d)
                 continue
 
             # variable assignments (strip an optional leading `export`)
