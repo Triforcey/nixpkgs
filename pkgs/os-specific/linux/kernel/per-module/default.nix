@@ -603,7 +603,7 @@ let
               # retained source copy.
               for t in $rootRelTargets; do
                 mkdir -p "modsrc/${m.dir}/$(dirname "$t")"
-                ln -sfn "$coreBuild/lib/modules/${modDirVersion}/source/$t" \
+                ln -sfn "$coreDev/lib/modules/${modDirVersion}/source/$t" \
                   "modsrc/${m.dir}/$t"
               done
             ''}
