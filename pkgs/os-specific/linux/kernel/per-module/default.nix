@@ -688,7 +688,6 @@ let
           echo "dir=${m.dir}"
           echo "objects=${lib.concatStringsSep " " m.objects}"
           echo "extraDirs=${lib.concatStringsSep " " extraDirs}"
-          echo "extraIncDirs=''${extraIncDirs-}"
         } > "$out/manifest.txt"
 
         runHook postInstall
