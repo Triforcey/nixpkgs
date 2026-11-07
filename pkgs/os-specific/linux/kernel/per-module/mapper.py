@@ -908,7 +908,8 @@ class Mapper:
                         mktext = re.sub(r"\\\\\s*\n", " ", f.read())
                 except OSError:
                     continue
-                for mm in flag_re.finditer(mktext):
+
+                def handle_flag(mm, _base=base):
                     kind, rest = mm.group(1), mm.group(2)
                     if kind is None and mm.group(3):
                         # Plain tree-relative -I path (qtnfmac: ccflags-y
@@ -921,20 +922,20 @@ class Mapper:
                         # when the path IS the module dir (extraDirs
                         # excludes base).
                         pdir = os.path.normpath(mm.group(3).rstrip("/\\"))
-                        if pdir == base:
+                        if pdir == _base:
                             m["ownDirIncludeFirst"] = True
-                        elif (pdir.startswith(base + os.sep)
+                        elif (pdir.startswith(_base + os.sep)
                                 and os.path.isdir(
                                     os.path.join(self.srcdir, pdir))):
                             seen_dirs.add(pdir)
-                        continue
+                        return
                     if kind == "src":
                         # $(src) is the module dir in an M= build: the flag
                         # resolves inside modsrc once the named dir exists.
                         if not rest:
-                            continue
-                        rdir = os.path.normpath(os.path.join(base, rest))
-                        if (rdir != base
+                            return
+                        rdir = os.path.normpath(os.path.join(_base, rest))
+                        if (rdir != _base
                                 and os.path.isdir(os.path.join(self.srcdir, rdir))):
                             seen_dirs.add(rdir)
                     else:
@@ -942,6 +943,71 @@ class Mapper:
                         if (cdir and cdir not in candidates
                                 and os.path.isdir(os.path.join(self.srcdir, cdir))):
                             candidates.append(cdir)
+
+                # Simple single-assignment variables (amdgpu:
+                # FULL_AMD_PATH=$(src)/..) hide include directives and -I
+                # flags behind \$(VAR) that the literal scanners cannot
+                # see. Resolve them with bounded substitution (chained
+                # assignments resolve too: FULL_AMD_DISPLAY_PATH =
+                # \$(FULL_AMD_PATH)/\$(DISPLAY_FOLDER_NAME)); unknown vars
+                # stay \$(X) and are skipped downstream. Trailing comments
+                # are stripped from values so resolved paths stay clean.
+                assign = {}
+                for am in re.finditer(
+                        r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*[:+?]?=\s*(.+)$",
+                        mktext, re.M):
+                    name, val = am.group(1), am.group(2).split("#")[0].strip()
+                    if name not in assign and val:
+                        assign[name] = val
+
+                def subst(tok):
+                    for _ in range(7):
+                        nxt = re.sub(
+                            r"\$\(([A-Za-z_][A-Za-z0-9_]*)\)",
+                            lambda mm2: assign.get(mm2.group(1), mm2.group(0)),
+                            tok)
+                        if nxt == tok:
+                            break
+                        tok = nxt
+                    return tok
+
+                for mm in flag_re.finditer(mktext):
+                    handle_flag(mm)
+                for mm in flag_re.finditer(subst(mktext)):
+                    handle_flag(mm)
+
+                # include directives with \$(VAR)-based paths that resolve
+                # to sibling source dirs (amdgpu: include
+                # \$(FULL_AMD_PATH)/amdkfd/Makefile) need those dirs copied
+                # into modsrc at in-tree paths - extraDirs gives the copy
+                # AND the extraIncFlags -I. Only the module's own Makefile
+                # is scanned: an included dir (display) is copied whole,
+                # so ITS internal includes resolve against the modsrc copy
+                # at build time. srctree- and unresolved-var tokens resolve
+                # against the build tree and are skipped. Included
+                # Makefiles pull their object lists from the dir, so the
+                # dir (not the file) is what gets staged.
+                for im in re.finditer(
+                        r"^\s*(?:-include|sinclude|include)\s+(.+)$",
+                        mktext, re.M):
+                    for tok in im.group(1).split():
+                        rtok = subst(tok)
+                        if rtok.startswith("$(src)/"):
+                            rpath = os.path.normpath(os.path.join(
+                                base, rtok[len("$(src)/"):]))
+                        elif "$(" in rtok:
+                            continue
+                        else:
+                            rpath = os.path.normpath(os.path.join(base, rtok))
+                            if not os.path.exists(
+                                    os.path.join(self.srcdir, rpath)):
+                                rpath = os.path.normpath(rtok)
+                        if (rpath and not rpath.startswith("..")
+                                and not (rpath == base
+                                         or rpath.startswith(base + os.sep))
+                                and os.path.isdir(
+                                    os.path.join(self.srcdir, rpath))):
+                            seen_dirs.add(rpath)
 
             # Rule prerequisites and recipe words that escape the module
             # dir. Real kbuild resolves bare tokens against the make CWD
