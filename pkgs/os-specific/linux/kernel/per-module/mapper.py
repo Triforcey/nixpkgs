@@ -1005,9 +1005,22 @@ class Mapper:
                         if (rpath and not rpath.startswith("..")
                                 and not (rpath == base
                                          or rpath.startswith(base + os.sep))
-                                and os.path.isdir(
+                                and os.path.exists(
                                     os.path.join(self.srcdir, rpath))):
-                            seen_dirs.add(rpath)
+                            # Include targets are files (acp/Makefile);
+                            # the included Makefile pulls its object list
+                            # from its dir, so stage the containing dir -
+                            # that is what provides the sources and keeps
+                            # the dir's own relative references working.
+                            rdir = (os.path.dirname(rpath)
+                                    if os.path.isfile(
+                                        os.path.join(self.srcdir, rpath))
+                                    else rpath)
+                            if (rdir and rdir != base
+                                    and not rdir.startswith(base + os.sep)
+                                    and os.path.isdir(
+                                        os.path.join(self.srcdir, rdir))):
+                                seen_dirs.add(rdir)
 
             # Rule prerequisites and recipe words that escape the module
             # dir. Real kbuild resolves bare tokens against the make CWD
