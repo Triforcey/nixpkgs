@@ -433,10 +433,15 @@ let
           + lib.optionalString (lib.versionOlder version "7.0")
             " --remap-path-prefix=${core.dev}/lib/modules/${modDirVersion}/source/= --remap-path-scope=macro"
         );
-      } // lib.optionalAttrs ((m.rootRelTargets or [ ]) != [ ]) {
-        # Kernel-root-relative rule prerequisites the drv stages as
-        # modsrc file symlinks (scsi_mod: include/scsi/scsi_devinfo.h).
-        rootRelTargets = lib.concatStringsSep " " (m.rootRelTargets or [ ]);
+      } // lib.optionalAttrs ((m.rootRelPairs or [ ]) != [ ]) {
+        # Rule prerequisites/recipe words that escape the module dir,
+        # staged by the drv as modsrc file symlinks (scsi_mod:
+        # include/scsi/scsi_devinfo.h; nfsd:
+        # ../../Documentation/sunrpc/xdr/nfs4_1.x). Entries are
+        # "token::normalized" - the token is the path as written,
+        # resolved from the sub-make CWD (the module dir); normalized
+        # names the in-tree file for the symlink target.
+        rootRelPairs = lib.concatStringsSep " " (m.rootRelPairs or [ ]);
       };
 
       buildPhase =
@@ -594,17 +599,22 @@ let
             # NOTE: comments must sit BEFORE the make line - inside the
             # backslash-continued command a '#' would comment out every
             # remaining argument, including KCFLAGS, M= and the target.
-            ${lib.optionalString ((m.rootRelTargets or [ ]) != [ ]) ''
-              # Kernel-root-relative rule prerequisites (scsi_mod:
-              # \$(obj)/scsi_devinfo_tbl.c: include/scsi/scsi_devinfo.h)
+            ${lib.optionalString ((m.rootRelPairs or [ ]) != [ ]) ''
+              # Rule prerequisites/recipe words that escape the module
+              # dir (scsi_mod: include/scsi/scsi_devinfo.h; nfsd:
+              # ../../Documentation/sunrpc/xdr/nfs4_1.x and the
+              # ../../tools/net/sunrpc/xdrgen/xdrgen recipe tool)
               # resolve against the sub-make's CWD - the module dir -
               # where the pruned core tree lacks them. Stage file
-              # symlinks into modsrc so the relative paths hit the
-              # retained source copy.
-              for t in $rootRelTargets; do
-                mkdir -p "modsrc/${m.dir}/$(dirname "$t")"
-                ln -sfn "$coreDev/lib/modules/${modDirVersion}/source/$t" \
-                  "modsrc/${m.dir}/$t"
+              # symlinks at the module-dir-relative token path (../..
+              # pathwalks into modsrc root) targeting the normalized
+              # in-tree file in the retained source copy.
+              for p in $rootRelPairs; do
+                tok="''${p%%::*}"
+                norm="''${p##*::}"
+                mkdir -p "modsrc/${m.dir}/$(dirname "$tok")"
+                ln -sfn "$coreDev/lib/modules/${modDirVersion}/source/$norm" \
+                  "modsrc/${m.dir}/$tok"
               done
             ''}
             mkdir -p modsrc/a/b

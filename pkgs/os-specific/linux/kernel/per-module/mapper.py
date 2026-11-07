@@ -943,27 +943,54 @@ class Mapper:
                                 and os.path.isdir(os.path.join(self.srcdir, cdir))):
                             candidates.append(cdir)
 
-            # Kernel-root-relative rule prerequisites (scsi_mod:
-            # \$(obj)/scsi_devinfo_tbl.c: include/scsi/scsi_devinfo.h).
-            # Real kbuild resolves them against the make CWD - the kernel
-            # root - but the unit's single-module sub-make runs with the
-            # MODULE dir as CWD, where the pruned core tree lacks them;
-            # the drv stages file symlinks into modsrc for these.
-            root_rel = set()
+            # Rule prerequisites and recipe words that escape the module
+            # dir. Real kbuild resolves bare tokens against the make CWD
+            # - the kernel root in an in-tree build - but the unit's
+            # single-module sub-make runs with the MODULE dir as CWD,
+            # where the pruned core tree lacks them; the drv stages file
+            # symlinks into modsrc for these. Two shapes: scsi_mod
+            # $(obj)/scsi_devinfo_tbl.c: include/scsi/scsi_devinfo.h is
+            # kernel-root-relative as written; nfsd writes bare-target
+            # rules and recipe tool refs with ../ paths that pathwalk
+            # into modsrc root (../../Documentation/sunrpc/xdr/nfs4_1.x,
+            # ../../tools/net/sunrpc/xdrgen/xdrgen). Pairs are emitted
+            # as "token::normalized" - the token resolves from the
+            # module dir, the normalized path names the symlink target.
+            root_rel = {}
             for mk in ("Makefile", "Kbuild"):
                 try:
                     with open(os.path.join(self.srcdir, base, mk), errors="replace") as f:
                         mktext = re.sub(r"\\\\\s*\n", " ", f.read())
                 except OSError:
                     continue
-                for mm in RULE_PREREQ_RE.finditer(mktext):
-                    tok = mm.group(1)
+                toks = [mm.group(1) for mm in RULE_PREREQ_RE.finditer(mktext)]
+                # Whole-file word scan: bare-target rules and recipe
+                # tool references the rule regex misses. The isfile
+                # gates keep comment/prose noise out.
+                toks.extend(mm.group(0) for mm in re.finditer(r"\S+", mktext))
+                for tok in toks:
+                    ent = None
                     if tok.startswith("$(") or tok.startswith(base + os.sep):
                         continue
+                    if tok in ("Makefile", "Kbuild", "Kconfig"):
+                        # Top-level files every Makefile names; staging
+                        # them inside the module dir would shadow the
+                        # self/ copies.
+                        continue
                     if os.path.isfile(os.path.join(self.srcdir, tok)):
-                        root_rel.add(tok)
+                        ent = (tok, tok)
+                    elif tok.startswith(".."):
+                        norm = os.path.normpath(os.path.join(base, tok))
+                        if (not norm.startswith("..")
+                                and not (norm == base
+                                         or norm.startswith(base + os.sep))
+                                and os.path.isfile(os.path.join(self.srcdir, norm))):
+                            ent = (tok, norm)
+                    if ent is not None:
+                        root_rel[ent[0]] = ent[1]
             if root_rel:
-                m["rootRelTargets"] = sorted(root_rel)
+                m["rootRelPairs"] = [
+                    f"{tok}::{norm}" for tok, norm in sorted(root_rel.items())]
 
             # subdir-ccflags-y in ancestor Makefiles (kbuild propagates it
             # to all descendants; M= builds of the module dir never read

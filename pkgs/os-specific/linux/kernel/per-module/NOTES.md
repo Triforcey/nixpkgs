@@ -522,23 +522,38 @@ radius diff (old vs new modules.json rows), offline name-level Tarjan
 SCC check over the new map's deps, invariance eval (core + unaffected
 units byte-identical), then a kvm-family unit smoke build.
 
-## Kernel-root-relative rule prerequisites: rootRelTargets (fixed 2026-11-06)
+## Out-of-dir rule prerequisites and recipe words: rootRelPairs (fixed 2026-11-06)
 
 Module-unit single-module builds run kbuild's M= machinery, whose
-sub-make CWD is the MODULE dir. Rule prerequisites written
-kernel-root-relative (scsi_mod: `$(obj)/scsi_devinfo_tbl.c:
-include/scsi/scsi_devinfo.h` - a sed-generated source) resolve against
-that CWD and die with "No rule to make target" in the real build's
-kernel-root CWD they resolve fine. drivers/scsi/Makefile is the only
-Makefile in the tree with this pattern - 52 units share its Makefile and
-all need the staging.
+sub-make CWD is the MODULE dir. Tokens the Makefile expects to resolve
+against the real build's kernel-root CWD die with "No rule to make
+target" there. Two observed shapes:
 
-Fix: the mapper scans module Makefiles for `$(obj)/...:` rule
-prerequisites that are tree paths outside the module dir resolving to
-real source-tree files, records them as `rootRelTargets`, and the unit
-drv stages file symlinks into modsrc (`modsrc/<dir>/<path> ->`
-`$coreBuild/.../source/<path>`) so the CWD-relative lookup hits the
-retained source copy.
+- kernel-root-relative rule prerequisites (scsi_mod:
+  `$(obj)/scsi_devinfo_tbl.c: include/scsi/scsi_devinfo.h` - a
+  sed-generated source); drivers/scsi/Makefile is the only Makefile in
+  the tree with this pattern - 52 units share its Makefile and all
+  need the staging.
+- bare-target rules and recipe words written with `../` paths that
+  pathwalk into modsrc root (nfsd: `nfs4xdr_gen.c:`
+  `../../Documentation/sunrpc/xdr/nfs4_1.x` plus the
+  `../../tools/net/sunrpc/xdrgen/xdrgen` recipe tool and the
+  `../../include/linux/sunrpc/xdrgen/nfs4_1.h` phony prereq). fs/nfsd
+  is the only module Makefile with this pattern.
+
+Fix: the mapper scans module Makefiles - rule-regex tokens plus a
+whole-file word scan (isfile gates keep prose noise out;
+Makefile/Kbuild/Kconfig are excluded so the self/ copies are not
+shadowed) - and records stageable out-of-dir files as `rootRelPairs`
+entries `token::normalized`: the token is the path as written,
+resolved from the module dir; normalized names the in-tree file for
+the symlink target. The unit drv stages file symlinks at
+`modsrc/<dir>/<token>` (for `../` tokens mkdir/ln pathwalk into
+modsrc root) targeting `$coreDev/lib/modules/<ver>/source/<normalized>`
+(the fab6872375aa correction; `$coreBuild` was already .../build),
+so the CWD-relative lookup hits the retained source copy. Symlinking
+executables preserves the exec bit (xdrgen's nix-patched python
+shebang works).
 
 ## Known limitations (v2)
 
