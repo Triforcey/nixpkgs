@@ -1252,6 +1252,14 @@ class Mapper:
                                 # root are the in-tree search roots that
                                 # catch deep-relative includes.
                                 roots += [base, "include"]
+                            # -I roots discovered from \$(src)-relative
+                            # flags (future extraDirs) are also build-time
+                            # search roots (xe: -I\$(src)/compat-i915-
+                            # headers resolves its shim headers, whose own
+                            # ../../../i915/... includes then stage
+                            # i915/soc). Probed last so existing
+                            # resolutions are unchanged.
+                            roots += sorted(seen_dirs)
                             for c in roots:
                                 t2 = os.path.normpath(
                                     os.path.join(c, inc))
