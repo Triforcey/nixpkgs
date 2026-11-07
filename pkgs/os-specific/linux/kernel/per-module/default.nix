@@ -742,6 +742,12 @@ let
       while IFS=$'\t' read -r modOut modDir modName; do
         [ -n "$modOut" ] || continue
         mkdir -p "$buildRoot/$modDir"
+        # cp -a preserves the store's r-x perms: a parent-dir tier seeded
+        # earlier leaves read-only subdirs that a child-dir unit (3c509
+        # under builtin@drivers/net/ethernet) cannot write into - the
+        # trailing tree-wide chmod runs too late for intra-loop conflicts.
+        # Widen the target subtree BEFORE the copy.
+        chmod -R u+w "$buildRoot/$modDir"
         cp -a "$modOut/self/." "$buildRoot/$modDir/"
       done < "$moduleManifest"
 

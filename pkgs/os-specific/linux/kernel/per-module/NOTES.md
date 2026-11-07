@@ -590,3 +590,20 @@ in
   image = pm.image;                               # insert-sys-cert image
 }
 ```
+
+## Aggregate seeding: intra-loop read-only subdirs (fixed 2026-11-06)
+
+The aggregate's preBuild seeds every unit's stage-1 artifacts with
+`cp -a "$modOut/self/." "$buildRoot/$modDir/"`, then `chmod -R u+w`
+AFTER the whole loop. cp -a preserves store permissions (r-x dirs), so
+a parent-dir tier seeded earlier (builtin@drivers/net/ethernet) leaves
+read-only subdirs that a child-dir unit (3c509, dir
+drivers/net/ethernet/3com) cannot copy into - retry-19 died with 33
+`cp: cannot create regular file ... Permission denied` errors, all in
+one directory. The trailing chmod is too late for intra-loop
+parent/child conflicts.
+
+Fix: `chmod -R u+w "$buildRoot/$modDir"` after the mkdir and before
+each cp, widening the target subtree; the tree-wide chmod stays for the
+post-loop tail. Only the aggregate drv re-hashes (preBuild text);
+units and the core are untouched.
