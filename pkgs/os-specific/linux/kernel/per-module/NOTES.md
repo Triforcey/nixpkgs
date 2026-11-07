@@ -603,7 +603,10 @@ drivers/net/ethernet/3com) cannot copy into - retry-19 died with 33
 one directory. The trailing chmod is too late for intra-loop
 parent/child conflicts.
 
-Fix: `chmod -R u+w "$buildRoot/$modDir"` after the mkdir and before
-each cp, widening the target subtree; the tree-wide chmod stays for the
-post-loop tail. Only the aggregate drv re-hashes (preBuild text);
-units and the core are untouched.
+Fix: widen the deepest existing ancestor of the target before mkdir,
+then the target itself, before each cp (`until [ -d "$d" ]; do
+d="$(dirname "$d")"; done; chmod -R u+w "$d"`) - retry-20 showed the
+leaf chmod alone is not enough: arch/x86/coco/sev failed to mkdir
+because a parent unit had copied arch/x86/coco read-only. The tree-wide
+chmod stays for the post-loop tail. Only the aggregate drv re-hashes
+(preBuild text); units and the core are untouched.

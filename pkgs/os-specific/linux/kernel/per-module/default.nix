@@ -741,12 +741,16 @@ let
       # modpost/link/sign steps.
       while IFS=$'\t' read -r modOut modDir modName; do
         [ -n "$modOut" ] || continue
+        # cp -a preserves the store's r-x perms: an earlier unit can leave
+        # ANY ancestor of this modDir read-only (3c509 failed to write
+        # under builtin@drivers/net/ethernet; arch/x86/coco/sev failed to
+        # mkdir under a unit that copied arch/x86/coco) - the trailing
+        # tree-wide chmod runs too late for intra-loop conflicts. Widen
+        # the deepest existing ancestor before mkdir, then the target.
+        d="$buildRoot/$modDir"
+        until [ -d "$d" ]; do d="$(dirname "$d")"; done
+        chmod -R u+w "$d"
         mkdir -p "$buildRoot/$modDir"
-        # cp -a preserves the store's r-x perms: a parent-dir tier seeded
-        # earlier leaves read-only subdirs that a child-dir unit (3c509
-        # under builtin@drivers/net/ethernet) cannot write into - the
-        # trailing tree-wide chmod runs too late for intra-loop conflicts.
-        # Widen the target subtree BEFORE the copy.
         chmod -R u+w "$buildRoot/$modDir"
         cp -a "$modOut/self/." "$buildRoot/$modDir/"
       done < "$moduleManifest"
