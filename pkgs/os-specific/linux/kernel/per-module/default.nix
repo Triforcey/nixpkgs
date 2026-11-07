@@ -350,6 +350,19 @@ let
       extraDirs = lib.unique (
         (m.extraDirs or [ ]) ++ extraSourceDirs.${m.name} or [ ]
       );
+      # Dirs needing an explicit -Imodsrc/<dir> (mapper extraFlagDirs:
+      # srctree candidates and trace dirs). Everything else in extraDirs
+      # resolves at build time via the makefile's own -I\$(src)/x flags
+      # (which evaluate to modsrc paths) or via the copies at in-tree
+      # paths, and an extra -I would diverge from the real build's search
+      # order (xe: -Imodsrc/i915 shadowed the compat-i915-headers shim).
+      # Glue-added dirs keep their -I. extraIncDirs is emitted into the
+      # drv env ONLY when it differs from extraDirs, so units whose
+      # classification is all-or-nothing keep their drv hashes.
+      extraIncDirList = lib.unique (
+        (m.extraFlagDirs or [ ])
+        ++ lib.subtractLists (m.extraDirs or [ ]) extraDirs
+      );
       quotedFlags = lib.concatMapStringsSep " " lib.escapeShellArg moduleMakeFlags;
       # make target for the stage-1 object build. For composite modules
       # (and single objects named <name>.o at the dir root) the kbuild
@@ -433,6 +446,8 @@ let
           + lib.optionalString (lib.versionOlder version "7.0")
             " --remap-path-prefix=${core.dev}/lib/modules/${modDirVersion}/source/= --remap-path-scope=macro"
         );
+      } // lib.optionalAttrs (extraIncDirList != extraDirs && extraIncDirList != [ ]) {
+        extraIncDirs = lib.concatStringsSep " " extraIncDirList;
       } // lib.optionalAttrs ((m.rootRelPairs or [ ]) != [ ]) {
         # Rule prerequisites/recipe words that escape the module dir,
         # staged by the drv as modsrc file symlinks (scsi_mod:
@@ -666,6 +681,7 @@ let
           echo "dir=${m.dir}"
           echo "objects=${lib.concatStringsSep " " m.objects}"
           echo "extraDirs=${lib.concatStringsSep " " extraDirs}"
+          echo "extraIncDirs=''${extraIncDirs-}"
         } > "$out/manifest.txt"
 
         runHook postInstall

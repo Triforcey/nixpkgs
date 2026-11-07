@@ -86,6 +86,7 @@ stdenv.mkDerivation {
     while IFS= read -r line; do
       case "$line" in
         extraDirs=*) extraDirs="''${line#extraDirs=}" ;;
+        extraIncDirs=*) extraIncDirs="''${line#extraIncDirs=}" ;;
       esac
     done < "$compileDrv/manifest.txt"
     for d in $extraDirs; do
@@ -108,8 +109,15 @@ stdenv.mkDerivation {
     # Bare-name quoted includes resolved via the module Makefile's
     # -I$(srctree)/x flags: srctree is the pruned dev tree, so point gcc
     # at the modsrc copies of the mapper-detected dirs instead.
+    # Explicit -I roots only: dirs the sandbox cannot resolve on its own
+    # (mapper extraFlagDirs - srctree candidates, trace dirs). Everything
+    # else in extraDirs resolves via the makefile's own -I\$(src)/x flags
+    # (which evaluate to modsrc paths) or the in-tree copies; an extra -I
+    # would diverge from the real build's search order (xe:
+    # -Imodsrc/i915 shadowed the compat-i915-headers shim). Falls back to
+    # the full extraDirs list when the compile drv recorded no split.
     extraIncFlags=""
-    for d in $extraDirs; do
+    for d in ''${extraIncDirs:-$extraDirs}; do
       extraIncFlags="$extraIncFlags -I$PWD/modsrc/$d"
     done
 

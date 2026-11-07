@@ -897,6 +897,14 @@ class Mapper:
         for m in self.modules.values():
             base = m["dir"]
             seen_dirs = {base}
+            # Dirs whose -I the sandbox must carry explicitly: srctree
+            # candidates and trace dirs. Everything else staged into
+            # seen_dirs resolves at build time via the makefile's own
+            # -I$(src)/x flags (which evaluate to modsrc paths) or via
+            # the copies at in-tree paths; an extra -I for those diverges
+            # from the real build's search order (xe: -Imodsrc/i915
+            # shadowed the compat-i915-headers shim).
+            flag_dirs = set()
             frontier = [base]
             candidates = []
             for mk in ("Makefile", "Kbuild"):
@@ -1176,8 +1184,13 @@ class Mapper:
                             ):
                                 if os.path.exists(os.path.join(self.srcdir, loc)):
                                     d = os.path.dirname(loc)
-                                    if d and d != base and d not in seen_dirs:
+                                    if d and d != base:
                                         seen_dirs.add(d)
+                                        # TRACE_INCLUDE dirs resolve in the
+                                        # real build via -I flags that are
+                                        # dead in the sandbox; keep them in
+                                        # the explicit -I set.
+                                        flag_dirs.add(d)
                                     elif d == base:
                                         # The trace header lives in the module
                                         # dir itself. In-tree the define_trace
@@ -1284,6 +1297,12 @@ class Mapper:
                                         # -I entry: -I<dir> + <inc> hits
                                         # the copied file.
                                         td = c
+                                        if c in candidates:
+                                            # srctree -I roots are dead in
+                                            # the sandbox (-I$(srctree)/x
+                                            # points at the pruned tree);
+                                            # keep the explicit -I.
+                                            flag_dirs.add(td)
                                     if td and td not in seen_dirs:
                                         seen_dirs.add(td)
                                     if td == base:
@@ -1315,6 +1334,7 @@ class Mapper:
                 if sd and not (sd == m["dir"] or sd.startswith(m["dir"] + os.sep)):
                     seen_dirs.add(sd)
             m["extraDirs"] = sorted(seen_dirs - {base})
+            m["extraFlagDirs"] = sorted(flag_dirs - {base})
             # Option A: the full transitive include closure (file level) is
             # needed to decide which host patches a module must apply.
             m["closureFiles"] = sorted(scanned_files)
