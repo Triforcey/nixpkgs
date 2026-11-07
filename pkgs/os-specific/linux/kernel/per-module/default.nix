@@ -479,10 +479,17 @@ let
           # srctree (the pruned dev tree) during the M= build; the
           # mapper-detected dirs are copied into modsrc, and these KCFLAGS
           # -I entries make bare-name quoted includes resolve against the
-          # modsrc copies.
+          # modsrc copies. Only dirs the sandbox cannot resolve otherwise
+          # (extraIncDirList: srctree candidates, trace dirs, glue adds) -
+          # a -I for copy-only dirs lands in KCFLAGS BEFORE module ccflags
+          # and diverges from the real build's search order (xe:
+          # -Imodsrc/i915 shadowed the compat-i915-headers shim, so
+          # display/ext/i915_irq.c resolved the real i915_irq.h and died
+          # on undefined struct xe_device).
           extraIncludeFlags = lib.concatMapStringsSep " " (
             d: "-I$PWD/modsrc/${d}"
-          ) extraDirs;
+          ) (if extraIncDirList != extraDirs && extraIncDirList != [ ]
+            then extraIncDirList else extraDirs);
           # Writable private trees for copy-case units: reflink copies of
           # the prepared build (objtree) and source (srctree) trees, with
           # the build tree's outputmakefile shim repointed at the copy.
