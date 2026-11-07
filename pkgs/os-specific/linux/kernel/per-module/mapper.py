@@ -1222,8 +1222,16 @@ class Mapper:
                             # enqueue the reached header so its own
                             # includes are followed as well
                             files_nxt.append(target)
-                        elif not quoted or "/" not in inc:
-                            # Unresolved bare-name or angle include:
+                        elif (not quoted or "/" not in inc
+                                or (quoted and ".." in inc)):
+                            # Unresolved bare-name or angle include, or a
+                            # quoted path-carrying include that misses from
+                            # the including file's dir (i915:
+                            # gt/intel_rps.c "../../../platform/x86/
+                            # intel_ips.h" resolves in-tree via the module
+                            # dir -I\$(src) from subdir-ccflags-y, not from
+                            # gt/): resolved via the collected
+                            # -I\$(srctree) include roots.
                             # resolved via the collected -I$(srctree)
                             # include roots. For ANGLE includes carrying
                             # an explicit ../ escape the including file's
@@ -1237,7 +1245,12 @@ class Mapper:
                             # root too, and record the JOINED dir (a ../
                             # join lands OUTSIDE the probed root).
                             roots = list(candidates)
-                            if not quoted and inc.startswith(".."):
+                            if inc.startswith(".."):
+                                # ../ escapes the probed root regardless of
+                                # quoting; the module dir (-I\$(src) via
+                                # subdir-ccflags-y) and the global include
+                                # root are the in-tree search roots that
+                                # catch deep-relative includes.
                                 roots += [base, "include"]
                             for c in roots:
                                 t2 = os.path.normpath(
