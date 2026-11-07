@@ -628,3 +628,19 @@ such dir), and the postInstall append restores it into the final build
 tree - mirroring the existing Module.symvers stash. Only the aggregate
 drv re-hashes (the core's build.nix keepPaths stays untouched); expect
 the aggregate's seeded-staleness CC storm again (~2.5 h).
+
+## Image rebuild: vmlinux.unstripped (fixed 2026-11-06)
+
+retry-22 got the image build past the relocs TOOL (the x86-tools stash
+worked) but the tool itself failed: `Cannot open vmlinux.unstripped`.
+vmlinux.unstripped is the real link output (LD/BTFIDS/SORTTAB in the
+aggregate log) and sits in the top Makefile's CLEAN_FILES, so `make
+clean` removes it and the keepPaths rescue list carries only vmlinux;
+the compressed Makefile's relocs rule (line 130) reads it, and the
+image tier's --assume-old=vmlinux.unstripped treats it as up to date
+even when missing.
+
+Fix: the image tier's preBuild links the kept vmlinux under the
+unstripped name after insert-sys-cert (hard link, cp fallback) - the
+unpacked tree is writable. Only the image and kernel drvs re-hash; the
+aggregate stays cached.

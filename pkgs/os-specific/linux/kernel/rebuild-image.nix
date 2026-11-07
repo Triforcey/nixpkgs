@@ -57,6 +57,17 @@ stdenv.mkDerivation {
     if [[ -v moduleCertificates ]]; then
       scripts/insert-sys-cert -b vmlinux -c "$moduleCertificates"
     fi
+    # The relocs rule (arch/x86/boot/compressed/Makefile:130) reads
+    # vmlinux.unstripped - the real link output (LD vmlinux.unstripped
+    # in the aggregate log), which the stock postInstall does not keep:
+    # it is in CLEAN_FILES, so `make clean` removes it and the keepPaths
+    # rescue list carries only vmlinux. The unpacked tree is writable
+    # (stdenv chmods u+w), so link the kept vmlinux under the unstripped
+    # name - --assume-old=vmlinux.unstripped then treats it as up to
+    # date and the RELOCS step can read it (retry-22: 'Cannot open
+    # vmlinux.unstripped'). Hard link first (no extra space); fall back
+    # to a copy across filesystems.
+    ln vmlinux vmlinux.unstripped || cp -a vmlinux vmlinux.unstripped
   '';
 
   env = kernel.env // {
