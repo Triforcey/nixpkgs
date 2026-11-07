@@ -610,3 +610,21 @@ leaf chmod alone is not enough: arch/x86/coco/sev failed to mkdir
 because a parent unit had copied arch/x86/coco read-only. The tree-wide
 chmod stays for the post-loop tail. Only the aggregate drv re-hashes
 (preBuild text); units and the core are untouched.
+
+## Aggregate retained tree: x86 relocs host tools (fixed 2026-11-06)
+
+retry-21 got the aggregate through units + manifest + link (DEPMOD
+completed), but the image rebuild then died in arch/x86/boot/compressed
+at the RELOCS step: `arch/x86/tools/relocs: No such file or directory`.
+The stock postInstall's keepPaths rescue list does not carry the
+arch/x86/tools host binaries, and the writable-delete
+(`find . -type f -perm -u=w -delete`) removes them after clean; the
+compressed Makefile only references the tool as a plain prerequisite,
+so the sub-make cannot rebuild it either.
+
+Fix: the aggregate's preInstall (pre-clean) stashes the whole
+arch/x86/tools dir into $NIX_BUILD_TOP/x86-tools.stash (aarch64 has no
+such dir), and the postInstall append restores it into the final build
+tree - mirroring the existing Module.symvers stash. Only the aggregate
+drv re-hashes (the core's build.nix keepPaths stays untouched); expect
+the aggregate's seeded-staleness CC storm again (~2.5 h).

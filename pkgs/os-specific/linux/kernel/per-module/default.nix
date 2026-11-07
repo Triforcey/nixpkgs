@@ -772,11 +772,24 @@ let
       # the stock postInstall's clean drops Module.symvers (it is not in
       # the keepPaths list) - out-of-tree modules need it
       cp "$buildRoot/Module.symvers" "$NIX_BUILD_TOP/Module.symvers.stash" 2>/dev/null || true
+      # arch/x86/tools host tools (relocs) are likewise dropped: the
+      # keepPaths rescue list does not carry them and the writable-delete
+      # removes the built binaries. The image rebuild's RELOCS step execs
+      # arch/x86/tools/relocs directly (retry-21: 'relocs: No such file
+      # or directory'). Stash the whole dir pre-clean; aarch64 has no
+      # such dir.
+      if [ -d "$buildRoot/arch/x86/tools" ]; then
+        cp -a "$buildRoot/arch/x86/tools" "$NIX_BUILD_TOP/x86-tools.stash"
+      fi
     '';
     postInstall = (old.postInstall or "") + ''
       if [ -f "$NIX_BUILD_TOP/Module.symvers.stash" ]; then
         mkdir -p "$dev/lib/modules/${modDirVersion}/build"
         cp "$NIX_BUILD_TOP/Module.symvers.stash" "$dev/lib/modules/${modDirVersion}/build/Module.symvers"
+      fi
+      if [ -d "$NIX_BUILD_TOP/x86-tools.stash" ]; then
+        cp -a "$NIX_BUILD_TOP/x86-tools.stash" \
+          "$dev/lib/modules/${modDirVersion}/build/arch/x86/tools"
       fi
     '';
   });
