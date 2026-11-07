@@ -644,3 +644,19 @@ Fix: the image tier's preBuild links the kept vmlinux under the
 unstripped name after insert-sys-cert (hard link, cp fallback) - the
 unpacked tree is writable. Only the image and kernel drvs re-hash; the
 aggregate stays cached.
+
+## aarch64 core: INSTALL_DTBS_PATH not carried (fixed 2026-11-07)
+
+The first real aarch64 build (build-all-hosts on nixbuild) died in the
+core's installPhase: `dtbs_install` ran with the stock default
+INSTALL_DTBS_PATH (/boot/dtbs) and the sandbox denied it. nixpkgs'
+build.nix carries `INSTALL_DTBS_PATH=${placeholder "out"}/dtbs` in the
+kernel's installFlags; the core wholesale-replaces the installPhase and
+invoked `make ${makeFlags} dtbs_install` - makeFlags, not installFlags -
+so the variable never reached make. x86 never hit this (buildDTBs
+false gates the block out).
+
+Fix: pass INSTALL_DTBS_PATH=$out/dtbs explicitly on the dtbs_install
+make line. x86 core drv identity unchanged (the block interpolates to
+the same text when buildDTBs is false); the aarch64 core re-hashes,
+which re-hashes the aarch64 units/aggregate through core.dev - correct.

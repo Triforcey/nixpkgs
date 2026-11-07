@@ -289,7 +289,10 @@ let
     installPhase = ''
       runHook preInstall
       ${lib.optionalString kernel.buildDTBs ''
-        make "''${makeFlags[@]}" dtbs_install
+        # INSTALL_DTBS_PATH lives in the stock kernel's installFlags, which
+        # this wholesale-replaced installPhase does not pass (retry: dtbs
+        # install defaulted to /boot/dtbs -> sandbox Permission denied).
+        make "''${makeFlags[@]}" INSTALL_DTBS_PATH="$out/dtbs" dtbs_install
       ''}
       mkdir -p "$out"
       touch "$out/.prepare-only"
