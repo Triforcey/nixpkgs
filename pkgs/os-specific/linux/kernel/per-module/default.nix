@@ -500,6 +500,9 @@ let
             cp -a --reflink=auto "$coreDev/lib/modules/${modDirVersion}/build/." "$PWD/build/"
             cp -a --reflink=auto "$coreDev/lib/modules/${modDirVersion}/source/." "$PWD/source/"
             chmod -R u+w build source
+            ${breakDedupLinks}
+            breakDedupLinks "$PWD/build"
+            breakDedupLinks "$PWD/source"
             sed -i \
               -e "s|^export KBUILD_OUTPUT.*|export KBUILD_OUTPUT = $PWD/build|" \
               -e "s|^include .*|include $PWD/source/Makefile|" \
@@ -529,6 +532,29 @@ let
               for p in $modulePatches; do
                 patch --forward -d "$1" -p1 < "$p" || true
               done
+            }
+          '';
+          breakDedupLinks = ''
+            # Break nix store dedup hardlinks: cp -a preserves them, and the
+            # five tiny rust crate objects (bindings/ffi/pin_init/uapi/
+            # zerocopy.o) are byte-identical empty --emit=obj outputs, so
+            # store dedup collapses them into ONE inode. A later in-place
+            # rewrite of any of them then rewrites all five: uapi.o's
+            # rebuild clobbered zerocopy.o's identity AND false-freshened
+            # it past its rebuilt compiler_builtins prereq, the zerocopy
+            # rule skipped, and kernel.o died with a note-less E0463 (the
+            # -L probe rejects a candidate whose recorded dependency hashes
+            # do not match the tree's mixed core-era/unit-era rmetas).
+            # Deduped files are identical by definition, so giving each its
+            # own inode preserves content exactly; cp -p keeps mtimes so
+            # the touch scheme below stays intact.
+            breakDedupLinks() {
+              find "$1" -type f -links +1 -exec sh -c '
+                for f do
+                  t=$(mktemp "$f.pmXXXXXX") || exit 1
+                  cp -p --reflink=auto "$f" "$t" && chmod u+w "$t" \
+                    && mv -f "$t" "$f" || { rm -f "$t"; exit 1; }
+                done' sh {} +
             }
           '';
         in
@@ -595,6 +621,8 @@ let
             chmod -R u+w modsrc
             ${copyExtra}
             chmod -R u+w modsrc
+            ${breakDedupLinks}
+            breakDedupLinks "$PWD/modsrc"
             applyUnitPatches "$PWD/modsrc"
             chmod -R u+w modsrc
 
@@ -759,6 +787,19 @@ let
       done < "$moduleManifest"
 
       chmod -R u+w "$buildRoot"
+
+      # Break store-dedup hardlinks (see the units' breakDedupLinks): the
+      # seeded unit outputs can carry hardlinked identical files, and the
+      # link/modpost steps rewrite files in place.
+      breakDedupLinks() {
+        find "$1" -type f -links +1 -exec sh -c '
+          for f do
+            t=$(mktemp "$f.pmXXXXXX") || exit 1
+            cp -p --reflink=auto "$f" "$t" && chmod u+w "$t" \
+              && mv -f "$t" "$f" || { rm -f "$t"; exit 1; }
+          done' sh {} +
+      }
+      breakDedupLinks "$buildRoot"
 
       export KBUILD_NOCMDDEP=1
     '';

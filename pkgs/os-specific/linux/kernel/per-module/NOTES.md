@@ -660,3 +660,49 @@ Fix: pass INSTALL_DTBS_PATH=$out/dtbs explicitly on the dtbs_install
 make line. x86 core drv identity unchanged (the block interpolates to
 the same text when buildDTBs is false); the aarch64 core re-hashes,
 which re-hashes the aarch64 units/aggregate through core.dev - correct.
+
+## builtin units: store-dedup hardlinks clobber rust crate objects (fixed 2026-11-07)
+
+The aarch64 7.3 builtin-rust unit flaked with a note-less
+`E0463: can't find crate for zerocopy` (first on nixbuild's farm run,
+then reproduced locally under binfmt emulation; x86 6.18.59 passed 25/25
+forced rebuilds). `--keep-failed` autopsy + isolated rustc runs pinned
+the full chain:
+
+1. The core's dev output carries five byte-identical tiny rust crate
+   objects (bindings/ffi/pin_init/uapi/zerocopy.o - all empty
+   `--emit=obj` outputs of crates with nothing to monomorphize). Store
+   dedup (auto-optimise hardlinks) collapses them into ONE inode.
+2. `cp -a` preserves hardlinks, so every unit's staged build tree has
+   the five names sharing one inode.
+3. The unit's uapi.o rule rebuilt (SYNC-regenerated config deps) and
+   wrote `rust/uapi.o` THROUGH THE SHARED INODE: all five names became
+   uapi's 960-byte object with mtime=now. zerocopy.o was thereby
+   false-freshened past its just-rebuilt compiler_builtins prereq, so
+   make skipped the zerocopy rule (NOCMDDEP + savedcmd present).
+4. The skip left the core-era `libzerocopy.rmeta` in a tree of
+   unit-era rmetas. kernel.o's `-L./rust` probe rejects a candidate
+   whose recorded dependency hashes don't match the tree (bisected:
+   restoring zerocopy.o alone still failed; restoring
+   libcompiler_builtins.rmeta instead moved the error to ffi/bindings)
+   -> note-less E0463.
+5. Environment-dependent: wherever the store/build FS hardlinks the
+   identical objects (local store auto-optimise, nixbuild.net dedup)
+   the clobber happens; without dedup zerocopy.o keeps its seeded
+   mtime, its rebuilt prereq is strictly newer, the rule runs, and the
+   chain is consistent.
+
+Fix: `breakDedupLinks` - after every seeding copy (stagePrivateTree
+build+source, common-case modsrc, aggregate buildRoot), give every
+multi-link file its own inode. Deduped files are identical by
+definition, so content is preserved exactly; `cp -p` keeps mtimes so
+the artifact/source touch scheme stays intact. With links broken,
+zerocopy.o keeps its seeded mtime, its rebuilt prereq is strictly
+newer, the rule deterministically runs, and the unit-era chain stays
+consistent.
+
+Validation (isolated rustc runs against the kept failed tree):
+failure-state -> E0463; fresh zerocopy rebuild in unit context ->
+RC=0; subsequent kernel.o errors tracked exactly the remaining mixed
+era boundaries (ffi/bindings after a compiler_builtins restore), as
+the model predicts.
