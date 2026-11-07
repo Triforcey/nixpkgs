@@ -1258,8 +1258,13 @@ class Mapper:
                             # headers resolves its shim headers, whose own
                             # ../../../i915/... includes then stage
                             # i915/soc). Probed last so existing
-                            # resolutions are unchanged.
-                            roots += sorted(seen_dirs)
+                            # resolutions are unchanged. base is excluded:
+                            # bare includes from subdir sources that hit it
+                            # resolve at build time through the makefile's
+                            # own -I\$(src) (exported subdir-ccflags-y), so
+                            # staging/ownDirIncludeFirst would be redundant
+                            # churn with header-shadowing risk.
+                            roots += sorted(d for d in seen_dirs if d != base)
                             for c in roots:
                                 t2 = os.path.normpath(
                                     os.path.join(c, inc))
